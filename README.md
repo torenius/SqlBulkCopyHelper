@@ -1,0 +1,1 @@
+This library makes it possible to use IEnumerable<T> togheter with SqlBulkCopy, by wrapping the list of value in a DataReader. This makes it possible to stream insert data and drastically reduce the memory footprint.
