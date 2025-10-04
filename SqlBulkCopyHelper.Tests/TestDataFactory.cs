@@ -16,12 +16,12 @@ public static class TestDataFactory
                 ByteArrayColumn = new byte[10],
                 ShortColumn = (short)random.Next(32768),
                 IntColumn = random.Next(),
-                NullableIntColumn = isNotNull ? random.Next() : null,
                 LongColumn = random.NextInt64(),
                 DecimalColumn = Math.Round((decimal)random.NextDouble() * 100_000_000_000, 10),
                 DoubleColumn = Math.Round(random.NextDouble() * 100_000_000_000, 10),
                 DateTimeColumn = DateTime.Now,
                 GuidColumn = Guid.NewGuid(),
+                NullableIntColumn = isNotNull ? random.Next() : null,
             };
 
             random.NextBytes(td.ByteArrayColumn);
@@ -46,11 +46,11 @@ public class TestData
     public byte[] ByteArrayColumn{ get; set; }
     public short ShortColumn { get; set; }
     public int IntColumn { get; set; }
-    public int? NullableIntColumn { get; set; }
     public long LongColumn { get; set; }
     public decimal DecimalColumn { get; set; }
     public double DoubleColumn { get; set; }
     public DateTime DateTimeColumn { get; set; }
     public Guid GuidColumn { get; set; }
     public string StringColumn { get; set; }
+    public int? NullableIntColumn { get; set; }
 }

@@ -100,7 +100,8 @@ internal class DisguisedDataReader<TEntity> : DbDataReader
     public override bool IsDBNull(int ordinal)
     {
         var data = GetValue(ordinal);
-        return data == DBNull.Value;
+        // ReSharper disable once ConditionIsAlwaysTrueOrFalseAccordingToNullableAPIContract
+        return data is null || data == DBNull.Value;
     }
 
     public override int FieldCount => _columnDefinitions.Count;
@@ -143,8 +144,6 @@ internal class DisguisedDataReader<TEntity> : DbDataReader
         table.Columns.Add("DataType", typeof(Type));
         table.Columns.Add("DataTypeName", typeof(string));
         table.Columns.Add("ColumnSize", typeof(int));
-        table.Columns.Add("NumericPrecision", typeof(int));
-        table.Columns.Add("NumericScale", typeof(int));
         table.Columns.Add("AllowDBNull", typeof(bool));
 
         for (var i = 0; i < _columnDefinitions.Count; i++)
@@ -155,9 +154,7 @@ internal class DisguisedDataReader<TEntity> : DbDataReader
             row["ColumnName"] = _columnDefinitions[i].ColumnName;
             row["DataType"] = _columnDefinitions[i].Type;
             row["DataTypeName"] = _columnDefinitions[i].Type.Name;
-            row["ColumnSize"] = _columnDefinitions[i].ColumnSize;
-            row["NumericPrecision"] = _columnDefinitions[i].NumericPrecision;
-            row["NumericScale"] = _columnDefinitions[i].NumericScale;
+            row["ColumnSize"] = -1;
             row["AllowDBNull"] = _columnDefinitions[i].Nullable;
 
             table.Rows.Add(row);

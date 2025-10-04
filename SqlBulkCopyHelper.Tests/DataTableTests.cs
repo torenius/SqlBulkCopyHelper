@@ -2,7 +2,7 @@
 
 namespace SqlBulkCopyHelper.Tests;
 
-public class TestDataTable
+public class DataTableTests
 {
     private class Test
     {
@@ -94,7 +94,7 @@ public class TestDataTable
         
         var dt = helper.GetDataTable(testData);
         
-        dt.Columns.Count.ShouldBe(11);
+        dt.Columns.Count.ShouldBe(12);
         dt.Columns[0].ColumnName.ShouldBe("BoolColumn");
         dt.Columns[0].DataType.ShouldBe(typeof(bool));
         
@@ -128,11 +128,15 @@ public class TestDataTable
         dt.Columns[10].ColumnName.ShouldBe("StringColumn");
         dt.Columns[10].DataType.ShouldBe(typeof(string));
         
+        dt.Columns[11].ColumnName.ShouldBe("NullableIntColumn");
+        dt.Columns[11].DataType.ShouldBe(typeof(int));
+        
         
         dt.Rows.Count.ShouldBe(nrOrRows);
         for (var i = 0; i < nrOrRows; i++)
         {
-            dt.Rows[i]["BoolColumn"].ShouldBe(testData[i].BoolColumn);
+            var isNotNull = (bool)dt.Rows[i]["BoolColumn"];
+            isNotNull.ShouldBe(testData[i].BoolColumn);
             dt.Rows[i]["ByteColumn"].ShouldBe(testData[i].ByteColumn);
             dt.Rows[i]["ByteArrayColumn"].ShouldBe(testData[i].ByteArrayColumn);
             dt.Rows[i]["ShortColumn"].ShouldBe(testData[i].ShortColumn);
@@ -143,6 +147,15 @@ public class TestDataTable
             dt.Rows[i]["DateTimeColumn"].ShouldBe(testData[i].DateTimeColumn);
             dt.Rows[i]["GuidColumn"].ShouldBe(testData[i].GuidColumn);
             dt.Rows[i]["StringColumn"].ShouldBe(testData[i].StringColumn);
+
+            if (isNotNull)
+            {
+                dt.Rows[i]["NullableIntColumn"].ShouldBe(testData[i].NullableIntColumn);
+            }
+            else
+            {
+                dt.Rows[i]["NullableIntColumn"].ShouldBe(DBNull.Value);
+            }
         }
     }
 

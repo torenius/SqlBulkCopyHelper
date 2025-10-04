@@ -46,25 +46,45 @@ public static class SqlBulkCopyHelperExtensions
         var instance = Expression.Parameter(type, type.Name);
         foreach (var property in props)
         {
-            var prop = Expression.Property(instance, property);
-            var convert = Expression.Convert(prop, typeof(object));
-            var lambda = Expression.Lambda<Func<T, object>>(convert, instance).Compile();
-
-            if (Nullable.GetUnderlyingType(property.PropertyType) != null)
-            {
-                helper.MapNullable(property.Name, lambda, property.PropertyType);
-            }
-            else
-            {
-                helper.Map(property.Name, lambda, property.PropertyType);
-            }
+            MapProperty(helper, instance, property);
         }
 
         return helper;
     }
 
     /// <summary>
-    /// Map a single value. Just a shorthand from: .Map(columnName, x => x);
+    /// Map a single property.
+    /// If no columnName is provided. The code assumes it can use the property name.
+    /// </summary>
+    /// <param name="helper">The SqlBulkCopyHelper</param>
+    /// <param name="property">The property to map</param>
+    /// <param name="columnName">The database column name</param>
+    /// <returns>The SqlBulkCopyHelper so you can continue with the builder pattern</returns>
+    public static SqlBulkCopyHelper<T> MapProperty<T>(this SqlBulkCopyHelper<T> helper, PropertyInfo property, string? columnName = null) where T : class
+    {
+        var type = typeof(T);
+        var instance = Expression.Parameter(type, type.Name);
+        return MapProperty(helper, instance, property);
+    }
+    
+    private static SqlBulkCopyHelper<T> MapProperty<T>(SqlBulkCopyHelper<T> helper, ParameterExpression instance, PropertyInfo property, string? columnName = null) where T : class
+    {
+        if (string.IsNullOrWhiteSpace(columnName))
+        {
+            columnName = property.Name;
+        }
+        
+        var prop = Expression.Property(instance, property);
+        var convert = Expression.Convert(prop, typeof(object));
+        var lambda = Expression.Lambda<Func<T, object>>(convert, instance).Compile();
+
+        helper.Map(columnName!, lambda, property.PropertyType);
+        
+        return helper;
+    }
+
+    /// <summary>
+    /// Map a single value. Just a shorthand for: .Map("ColumnName", x => x);
     /// </summary>
     /// <param name="helper">The SqlBulkCopyHelper</param>
     /// <param name="columnName">Database column name</param>

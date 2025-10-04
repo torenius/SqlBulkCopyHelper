@@ -15,14 +15,31 @@ public class SqlBulkCopyHelper<TEntity>
     private readonly string _tableName;
     private readonly List<DisguisedColumnDefinition<TEntity>> _columnDefinitions = [];
 
+    /// <summary>
+    /// Helper class easier and more memory efficient do a bulk insert of x amount of rows.
+    /// You need to call .Map or other methods to map what values should be inserted and to what column names
+    /// </summary>
+    /// <param name="tableName">The table to insert to. Could be the main table or a staging/temp table</param>
+    /// <exception cref="ArgumentNullException">If table name is null or empty it will throw</exception>
     public SqlBulkCopyHelper(string tableName)
     {
+        if (string.IsNullOrWhiteSpace(tableName)) throw new ArgumentNullException(nameof(tableName));
         _tableName = tableName;
     }
     
+    /// <summary>
+    /// If you need to convert your list of entities to a DataReader
+    /// </summary>
+    /// <param name="entities">Entities to convert</param>
+    /// <returns>DbDataReader that contains the mapped columns</returns>
     public DbDataReader GetDataReader(IEnumerable<TEntity> entities) =>
         new DisguisedDataReader<TEntity>(_columnDefinitions, entities);
 
+    /// <summary>
+    /// If you need to convert your list of entities to a DataTable
+    /// </summary>
+    /// <param name="entities">Entities to convert</param>
+    /// <returns>DataTable that contains the mapped columns</returns>
     public DataTable GetDataTable(IEnumerable<TEntity> entities)
     {
         var dt = new DataTable(_tableName);
@@ -30,6 +47,17 @@ public class SqlBulkCopyHelper<TEntity>
         return dt;
     }
     
+    /// <summary>
+    /// Helper method to make the call to SqlBulkCopy easier.
+    /// You can do this step yourself by just getting the DataReader from this class.
+    /// </summary>
+    /// <param name="connection">SqlConnection to connect to. If It's closed, this code will open it, do the insert then close it. If it was open it will be kept open</param>
+    /// <param name="entities">All the entities that will be inserted</param>
+    /// <param name="timeout">Number of seconds for the operation to complete before it times out. 0 equals no timeout. Default 30 seconds</param>
+    /// <param name="sqlBulkCopyOptions">Different options that SqlBulkCopy will consider</param>
+    /// <param name="sqlTransaction">If this should be done in a specific transaction or not</param>
+    /// <param name="cancellationToken">Do you like to have the option to cancel the operation?</param>
+    /// <returns>Number of rows inserted</returns>
     public async ValueTask<ulong> BulkInsertAsync(SqlConnection connection, IEnumerable<TEntity> entities,
         int timeout = 30, SqlBulkCopyOptions sqlBulkCopyOptions = SqlBulkCopyOptions.Default, SqlTransaction? sqlTransaction = null, CancellationToken cancellationToken = default)
     {
@@ -87,7 +115,11 @@ public class SqlBulkCopyHelper<TEntity>
     
     public IEnumerable<string> GetColumnNames() => _columnDefinitions.Select(x => x.ColumnName);
     
-    private readonly Dictionary<Type, string> _columnType = new()
+    /// <summary>
+    /// Can be used to add or change how Types are mapped for the value in SqlBulkCopyHelperColumnInfo.SchemaDefinition
+    /// Since intention is just to use these mappings for a staging table. They might be on the "bigger" side.
+    /// </summary>
+    public Dictionary<Type, string> SchemaDefinitionMapping = new()
     {
         {typeof(bool), "BIT"},
         {typeof(byte), "TINYINT"},
@@ -98,16 +130,20 @@ public class SqlBulkCopyHelper<TEntity>
         {typeof(uint), "BIGINT"},
         {typeof(long), "BIGINT"},
         {typeof(ulong), "BIGINT"},
-        {typeof(decimal), "NUMERIC"},
+        {typeof(decimal), "NUMERIC(38,15)"},
         {typeof(double), "FLOAT"},
-        {typeof(DateTime), "DATETIME2"},
+        {typeof(DateTime), "DATETIME2(7)"},
         {typeof(Guid), "UNIQUEIDENTIFIER"},
-        {typeof(string), "NVARCHAR"},
-        {typeof(char), "NCHAR"},
-        {typeof(char[]), "NVARCHAR"},
-        {typeof(byte[]), "VARBINARY"},
+        {typeof(string), "NVARCHAR(MAX)"},
+        {typeof(char), "NCHAR(MAX)"},
+        {typeof(char[]), "NVARCHAR(MAX)"},
+        {typeof(byte[]), "VARBINARY(MAX)"},
     };
 
+    /// <summary>
+    /// Get information about the columns that currently exists in this helper.
+    /// </summary>
+    /// <returns>SqlBulkCopyHelperColumnInfo</returns>
     public IEnumerable<SqlBulkCopyHelperColumnInfo> GetColumnInfo()
     {
         var sb = new StringBuilder();
@@ -116,42 +152,12 @@ public class SqlBulkCopyHelper<TEntity>
             sb.Clear();
             sb.Append(QuoteName(columnDefinition.ColumnName));
 
-            if (!_columnType.TryGetValue(columnDefinition.Type, out var columnType))
+            if (!SchemaDefinitionMapping.TryGetValue(columnDefinition.Type, out var columnType))
             {
                 columnType = "NVARCHAR(MAX)";
             }
             
             sb.Append(' ').Append(columnType);
-
-            if (columnDefinition.Type == typeof(string) || columnDefinition.Type == typeof(byte[]) || columnDefinition.Type == typeof(char[]))
-            {
-                if (columnDefinition.ColumnSize > 0 && columnDefinition.ColumnSize <= 8000)
-                {
-                    sb.Append('(').Append(columnDefinition.ColumnSize).Append(')');
-                }
-                else
-                {
-                    sb.Append("(MAX)");
-                }
-            }
-
-            if (columnDefinition.Type == typeof(decimal))
-            {
-                sb.Append('(').Append(columnDefinition.NumericPrecision);
-                if (columnDefinition.NumericScale > 0)
-                {
-                    sb.Append(", ").Append(columnDefinition.NumericScale);
-                }
-
-                sb.Append(')');
-            } 
-
-            if (!columnDefinition.Nullable)
-            {
-                sb.Append(" NOT");
-            }
-
-            sb.Append(" NULL");
 
             yield return new SqlBulkCopyHelperColumnInfo(
                 columnDefinition.ColumnName,
@@ -189,6 +195,13 @@ public class SqlBulkCopyHelper<TEntity>
         return sb.ToString();
     }
 
+    /// <summary>
+    /// Adds a mapping rule where we can infer the type from the lamda.
+    /// </summary>
+    /// <param name="columnName">Database column name</param>
+    /// <param name="propertyGetter">Lambda for getting the value</param>
+    /// <typeparam name="TProperty">The Type</typeparam>
+    /// <returns>The SqlBulkCopyHelper so you can continue with the builder pattern</returns>
     public SqlBulkCopyHelper<TEntity> Map<TProperty>(string columnName, Func<TEntity, TProperty> propertyGetter)
     {
         return AddOrUpdateColumn(new DisguisedColumnDefinition<TEntity>
@@ -199,17 +212,13 @@ public class SqlBulkCopyHelper<TEntity>
         });
     }
     
-    public SqlBulkCopyHelper<TEntity> MapNullable<TProperty>(string columnName, Func<TEntity, TProperty?> propertyGetter)
-    {
-        return AddOrUpdateColumn(new DisguisedColumnDefinition<TEntity>
-        {
-            ColumnName = columnName,
-            Type = typeof(TProperty),
-            PropertyGetter = (entity) => (object)propertyGetter(entity)!,
-            Nullable = true
-        });
-    }
-    
+    /// <summary>
+    /// Adds a mapping rule where we can't infer the type from the lamda.
+    /// </summary>
+    /// <param name="columnName">Database column name</param>
+    /// <param name="propertyGetter">Lambda for getting the value</param>
+    /// <param name="propertyType">The Type</param>
+    /// <returns>The SqlBulkCopyHelper so you can continue with the builder pattern</returns>
     public SqlBulkCopyHelper<TEntity> Map(string columnName, Func<TEntity, object> propertyGetter, Type propertyType)
     {
         return AddOrUpdateColumn(new DisguisedColumnDefinition<TEntity>
@@ -219,39 +228,39 @@ public class SqlBulkCopyHelper<TEntity>
             PropertyGetter = (entity) => propertyGetter(entity)!
         });
     }
-    
-    public SqlBulkCopyHelper<TEntity> MapNullable(string columnName, Func<TEntity, object?> propertyGetter, Type propertyType)
-    {
-        return AddOrUpdateColumn(new DisguisedColumnDefinition<TEntity>
-        {
-            ColumnName = columnName,
-            Type = propertyType,
-            PropertyGetter = (entity) => propertyGetter(entity)!,
-            Nullable = true
-        });
-    }
-    
-    public SqlBulkCopyHelper<TEntity> MapDecimal(string columnName, Func<TEntity, decimal> propertyGetter, int numericPrecision = 18, int numericScale = 0)
-    {
-        return AddOrUpdateColumn(new DisguisedColumnDefinition<TEntity>
-        {
-            ColumnName = columnName,
-            Type = typeof(decimal),
-            PropertyGetter = (entity) => (object)propertyGetter(entity),
-            NumericPrecision = numericPrecision,
-            NumericScale = numericScale
-        });
-    }
 
-    public SqlBulkCopyHelper<TEntity> MapString(string columnName, Func<TEntity, string> propertyGetter, int length = -1)
+    /// <summary>
+    /// Mapping is basically a dictionary where the columnName is the key.
+    /// If you for some reason need to remove a mapping.
+    /// Use this method. 
+    /// </summary>
+    /// <param name="columnName">Removes the mapping if it exits. It does not exist, nothing happen</param>
+    /// <returns>The SqlBulkCopyHelper so you can continue with the builder pattern</returns>
+    public SqlBulkCopyHelper<TEntity> RemoveMap(string columnName)
     {
-        return AddOrUpdateColumn(new DisguisedColumnDefinition<TEntity>
+        var columnDefinition = _columnDefinitions.FirstOrDefault(x => x.ColumnName == columnName);
+        if (columnDefinition is not null)
         {
-            ColumnName = columnName,
-            Type = typeof(string),
-            PropertyGetter = (entity) => (object)propertyGetter(entity),
-            ColumnSize = length
-        });
+            _columnDefinitions.Remove(columnDefinition);
+        }
+
+        return this;
+    }
+    
+    private SqlBulkCopyHelper<TEntity> AddOrUpdateColumn(DisguisedColumnDefinition<TEntity> disguisedColumnDefinition)
+    {
+        RemoveMap(disguisedColumnDefinition.ColumnName);
+
+        var underlyingType = Nullable.GetUnderlyingType(disguisedColumnDefinition.Type);
+        if (underlyingType is not null)
+        {
+            disguisedColumnDefinition.Type = underlyingType;
+            disguisedColumnDefinition.Nullable = true;
+        }
+        
+        _columnDefinitions.Add(disguisedColumnDefinition);
+
+        return this;
     }
 
     /// <summary>
@@ -298,18 +307,5 @@ public class SqlBulkCopyHelper<TEntity>
         }
         
         return name;
-    }
-    
-    private SqlBulkCopyHelper<TEntity> AddOrUpdateColumn(DisguisedColumnDefinition<TEntity> disguisedColumnDefinition)
-    {
-        var columnDefinition = _columnDefinitions.FirstOrDefault(x => x.ColumnName == disguisedColumnDefinition.ColumnName);
-        if (columnDefinition is not null)
-        {
-            _columnDefinitions.Remove(columnDefinition);
-        }
-        
-        _columnDefinitions.Add(disguisedColumnDefinition);
-
-        return this;
     }
 }

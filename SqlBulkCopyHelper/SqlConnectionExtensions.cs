@@ -14,7 +14,7 @@ public static class SqlConnectionExtensions
     /// <param name="connection">Connection to execute the insert on</param>
     /// <param name="tableName">Table to insert data into</param>
     /// <param name="entities">Entities to insert</param>
-    /// <param name="timeout">Number of seconds for the operation to complete before it times out. 0 equals no timeout</param>
+    /// <param name="timeout">Number of seconds for the operation to complete before it times out. 0 equals no timeout. Default 30 seconds</param>
     /// <param name="sqlBulkCopyOptions">Different options that SqlBulkCopy will consider</param>
     /// <param name="sqlTransaction">If this should be done in a specific transaction or not</param>
     /// <param name="cancellationToken">Do you like to have the option to cancel the operation?</param>
@@ -36,7 +36,7 @@ public static class SqlConnectionExtensions
     /// <param name="tableName">Table to insert data into</param>
     /// <param name="columnName">Name of the column to insert the values to</param>
     /// <param name="values">Values to insert</param>
-    /// <param name="timeout">Number of seconds for the operation to complete before it times out. 0 equals no timeout</param>
+    /// <param name="timeout">Number of seconds for the operation to complete before it times out. 0 equals no timeout. Default 30 seconds</param>
     /// <param name="sqlBulkCopyOptions">Different options that SqlBulkCopy will consider</param>
     /// <param name="sqlTransaction">If this should be done in a specific transaction or not</param>
     /// <param name="cancellationToken">Do you like to have the option to cancel the operation?</param>
