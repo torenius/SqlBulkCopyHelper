@@ -110,7 +110,7 @@ internal class DisguisedDataReader<TEntity> : DbDataReader
     public override object this[string name] => GetValue(GetOrdinal(name));
 
     public override int RecordsAffected => -1;
-    public override bool HasRows { get; }
+    public override bool HasRows => false;
     public override bool IsClosed => _enumerator == null;
 
     public override bool NextResult() => false;
@@ -168,11 +168,8 @@ internal class DisguisedDataReader<TEntity> : DbDataReader
 
     public override void Close()
     {
-        if (_enumerator != null)
-        {
-            _enumerator.Dispose();
-            _enumerator = null;
-            _currentEntity = default(TEntity);
-        }
+        _enumerator?.Dispose();
+        _enumerator = null;
+        _currentEntity = default(TEntity);
     }
 }

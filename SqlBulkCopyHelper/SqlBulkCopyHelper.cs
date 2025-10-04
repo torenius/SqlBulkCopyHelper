@@ -87,7 +87,7 @@ public class SqlBulkCopyHelper<TEntity>
     
     public IEnumerable<string> GetColumnNames() => _columnDefinitions.Select(x => x.ColumnName);
     
-    private static readonly Dictionary<Type, string> ColumnType = new()
+    private readonly Dictionary<Type, string> _columnType = new()
     {
         {typeof(bool), "BIT"},
         {typeof(byte), "TINYINT"},
@@ -108,7 +108,7 @@ public class SqlBulkCopyHelper<TEntity>
         {typeof(byte[]), "VARBINARY"},
     };
 
-    public IEnumerable<string> GetColumnSchemaDefinition()
+    public IEnumerable<SqlBulkCopyHelperColumnInfo> GetColumnInfo()
     {
         var sb = new StringBuilder();
         foreach (var columnDefinition in _columnDefinitions)
@@ -116,7 +116,7 @@ public class SqlBulkCopyHelper<TEntity>
             sb.Clear();
             sb.Append(QuoteName(columnDefinition.ColumnName));
 
-            if (!ColumnType.TryGetValue(columnDefinition.Type, out var columnType))
+            if (!_columnType.TryGetValue(columnDefinition.Type, out var columnType))
             {
                 columnType = "NVARCHAR(MAX)";
             }
@@ -153,7 +153,10 @@ public class SqlBulkCopyHelper<TEntity>
 
             sb.Append(" NULL");
 
-            yield return sb.ToString();
+            yield return new SqlBulkCopyHelperColumnInfo(
+                columnDefinition.ColumnName,
+                QuoteName(columnDefinition.ColumnName), 
+                sb.ToString());
         }
     }
 
@@ -167,7 +170,7 @@ public class SqlBulkCopyHelper<TEntity>
         sb.Append("CREATE TABLE ").AppendLine(string.Join(".", _tableName.Split('.').Select(QuoteName)));
         sb.AppendLine("(");
 
-        var columns = GetColumnSchemaDefinition().ToList();
+        var columns = GetColumnInfo().Select(x => x.SchemaDefinition).ToList();
 
         for (var i = 0; i < columns.Count; i++)
         {
