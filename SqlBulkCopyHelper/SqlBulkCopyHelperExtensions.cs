@@ -33,7 +33,7 @@ public static class SqlBulkCopyHelperExtensions
     /// <param name="helper">The SqlBulkCopyHelper</param>
     /// <param name="properties">The properties to map</param>
     /// <returns>The SqlBulkCopyHelper so you can continue with the builder pattern</returns>
-    /// <exception cref="InvalidOperationException">If the class have no public properties</exception>
+    /// <exception cref="InvalidOperationException">If no properties were supplied</exception>
     public static SqlBulkCopyHelper<T> MapProperties<T>(this SqlBulkCopyHelper<T> helper, IEnumerable<PropertyInfo> properties) where T : class
     {
         var props = properties.ToList();

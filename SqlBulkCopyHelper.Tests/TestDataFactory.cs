@@ -33,6 +33,7 @@ public static class TestDataFactory
                 stringValue[j] = Letters[random.Next(Letters.Length)];
             }
             td.StringColumn = new string(stringValue);
+            td.CharColumn = td.StringColumn[0];
 
             yield return td;
         }
@@ -53,4 +54,5 @@ public class TestData
     public Guid GuidColumn { get; set; }
     public string StringColumn { get; set; }
     public int? NullableIntColumn { get; set; }
+    public char CharColumn { get; set; }
 }

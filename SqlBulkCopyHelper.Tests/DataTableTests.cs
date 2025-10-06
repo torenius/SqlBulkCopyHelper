@@ -94,7 +94,7 @@ public class DataTableTests
         
         var dt = helper.GetDataTable(testData);
         
-        dt.Columns.Count.ShouldBe(12);
+        dt.Columns.Count.ShouldBe(13);
         dt.Columns[0].ColumnName.ShouldBe("BoolColumn");
         dt.Columns[0].DataType.ShouldBe(typeof(bool));
         
@@ -131,6 +131,8 @@ public class DataTableTests
         dt.Columns[11].ColumnName.ShouldBe("NullableIntColumn");
         dt.Columns[11].DataType.ShouldBe(typeof(int));
         
+        dt.Columns[12].ColumnName.ShouldBe("CharColumn");
+        dt.Columns[12].DataType.ShouldBe(typeof(char));
         
         dt.Rows.Count.ShouldBe(nrOrRows);
         for (var i = 0; i < nrOrRows; i++)
@@ -156,6 +158,8 @@ public class DataTableTests
             {
                 dt.Rows[i]["NullableIntColumn"].ShouldBe(DBNull.Value);
             }
+            
+            dt.Rows[i]["CharColumn"].ShouldBe(testData[i].CharColumn);
         }
     }
 

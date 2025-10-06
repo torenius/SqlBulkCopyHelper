@@ -58,12 +58,12 @@ public class SqlBulkCopyHelper<TEntity>
     /// <param name="sqlTransaction">If this should be done in a specific transaction or not</param>
     /// <param name="cancellationToken">Do you like to have the option to cancel the operation?</param>
     /// <returns>Number of rows inserted</returns>
-    public async ValueTask<ulong> BulkInsertAsync(SqlConnection connection, IEnumerable<TEntity> entities,
+    public async ValueTask<long> BulkInsertAsync(SqlConnection connection, IEnumerable<TEntity> entities,
         int timeout = 30, SqlBulkCopyOptions sqlBulkCopyOptions = SqlBulkCopyOptions.Default, SqlTransaction? sqlTransaction = null, CancellationToken cancellationToken = default)
     {
         if (cancellationToken.IsCancellationRequested)
         {
-            return await new ValueTask<ulong>(Task.FromCanceled<ulong>(cancellationToken));
+            return await new ValueTask<long>(Task.FromCanceled<long>(cancellationToken));
         }
 
         var closeConnection = false;
@@ -93,9 +93,9 @@ public class SqlBulkCopyHelper<TEntity>
         bulkCopy.DestinationTableName = string.Join(".", _tableName.Split('.').Select(QuoteName));
         bulkCopy.BulkCopyTimeout = timeout;
         
-        foreach (var columnName in GetColumnNames())
+        foreach (var columnInfo in GetColumnInfo())
         {
-            bulkCopy.ColumnMappings.Add(columnName, QuoteName(columnName));
+            bulkCopy.ColumnMappings.Add(columnInfo.ColumnName, columnInfo.QuotedColumnName);
         }
         
         await bulkCopy.WriteToServerAsync(GetDataReader(entities), cancellationToken);
@@ -110,41 +110,56 @@ public class SqlBulkCopyHelper<TEntity>
             connection.Close();
         }
 
-        return (ulong)bulkCopy.RowsCopied64;
+        return bulkCopy.RowsCopied64;
     }
-    
-    public IEnumerable<string> GetColumnNames() => _columnDefinitions.Select(x => x.ColumnName);
     
     /// <summary>
     /// Can be used to add or change how Types are mapped for the value in SqlBulkCopyHelperColumnInfo.SchemaDefinition
-    /// Since intention is just to use these mappings for a staging table. They might be on the "bigger" side.
+    /// Intention is just to use these mappings for a staging table. They might be on the "bigger" side.
     /// </summary>
     public Dictionary<Type, string> SchemaDefinitionMapping = new()
     {
-        {typeof(bool), "BIT"},
-        {typeof(byte), "TINYINT"},
-        {typeof(sbyte), "SMALLINT"},
-        {typeof(short), "SMALLINT"},
-        {typeof(ushort), "INT"},
-        {typeof(int), "INT"},
-        {typeof(uint), "BIGINT"},
-        {typeof(long), "BIGINT"},
-        {typeof(ulong), "BIGINT"},
-        {typeof(decimal), "NUMERIC(38,15)"},
-        {typeof(double), "FLOAT"},
-        {typeof(DateTime), "DATETIME2(7)"},
-        {typeof(Guid), "UNIQUEIDENTIFIER"},
-        {typeof(string), "NVARCHAR(MAX)"},
-        {typeof(char), "NCHAR(MAX)"},
-        {typeof(char[]), "NVARCHAR(MAX)"},
-        {typeof(byte[]), "VARBINARY(MAX)"},
+        {typeof(bool), "bit"},
+        {typeof(byte), "tinyint"},
+        {typeof(sbyte), "smallint"},
+        {typeof(short), "smallint"},
+        {typeof(ushort), "int"},
+        {typeof(int), "int"},
+        {typeof(uint), "bigint"},
+        {typeof(long), "bigint"},
+        {typeof(ulong), "bigint"},
+        {typeof(decimal), "numeric(38,15)"},
+        {typeof(double), "float"},
+        {typeof(DateTime), "datetime2(7)"},
+        {typeof(Guid), "uniqueidentifier"},
+        {typeof(string), "nvarchar(max)"},
+        {typeof(char), "nchar(1)"},
+        {typeof(char[]), "nvarchar(max)"},
+        {typeof(byte[]), "varbinary(max)"},
+        
+        {typeof(bool?), "bit"},
+        {typeof(byte?), "tinyint"},
+        {typeof(sbyte?), "smallint"},
+        {typeof(short?), "smallint"},
+        {typeof(ushort?), "int"},
+        {typeof(int?), "int"},
+        {typeof(uint?), "bigint"},
+        {typeof(long?), "bigint"},
+        {typeof(ulong?), "bigint"},
+        {typeof(decimal?), "numeric(38,15)"},
+        {typeof(double?), "float"},
+        {typeof(DateTime?), "datetime2(7)"},
+        {typeof(Guid?), "uniqueidentifier"},
+        {typeof(char?), "nchar(1)"},
     };
-
+    
+    /// <returns></returns>
     /// <summary>
     /// Get information about the columns that currently exists in this helper.
     /// </summary>
+    /// <param name="columnsArAlwaysNullable">If true all the SchemaDefinition will be nullable. If false it will be based on if the Type that was provided during mapping is nullable or not.</param>
     /// <returns>SqlBulkCopyHelperColumnInfo</returns>
-    public IEnumerable<SqlBulkCopyHelperColumnInfo> GetColumnInfo()
+    public IEnumerable<SqlBulkCopyHelperColumnInfo> GetColumnInfo(bool columnsArAlwaysNullable = true)
     {
         var sb = new StringBuilder();
         foreach (var columnDefinition in _columnDefinitions)
@@ -154,14 +169,23 @@ public class SqlBulkCopyHelper<TEntity>
 
             if (!SchemaDefinitionMapping.TryGetValue(columnDefinition.Type, out var columnType))
             {
-                columnType = "NVARCHAR(MAX)";
+                columnType = "nvarchar(max)";
             }
             
             sb.Append(' ').Append(columnType);
 
+            if (!columnsArAlwaysNullable && !columnDefinition.Nullable)
+            {
+                sb.Append(" not");
+            }
+
+            sb.Append(" null");
+
             yield return new SqlBulkCopyHelperColumnInfo(
                 columnDefinition.ColumnName,
-                QuoteName(columnDefinition.ColumnName), 
+                QuoteName(columnDefinition.ColumnName),
+                columnType,
+                columnDefinition.Nullable,
                 sb.ToString());
         }
     }
@@ -169,14 +193,15 @@ public class SqlBulkCopyHelper<TEntity>
     /// <summary>
     /// This is more for creating a staging table.
     /// </summary>
+    /// <param name="columnsArAlwaysNullable">If true all columns will be nullable. If false it will be based on if the Type that was provided during mapping is nullable or not.</param>
     /// <returns>A script that can be run against the database to create a staging table.</returns>
-    public string CreateTableScript()
+    public string CreateTableScript(bool columnsArAlwaysNullable = true)
     {
         var sb = new StringBuilder();
-        sb.Append("CREATE TABLE ").AppendLine(string.Join(".", _tableName.Split('.').Select(QuoteName)));
+        sb.Append("create table ").AppendLine(string.Join(".", _tableName.Split('.').Select(QuoteName)));
         sb.AppendLine("(");
 
-        var columns = GetColumnInfo().Select(x => x.SchemaDefinition).ToList();
+        var columns = GetColumnInfo(columnsArAlwaysNullable).Select(x => x.SchemaDefinition).ToList();
 
         for (var i = 0; i < columns.Count; i++)
         {

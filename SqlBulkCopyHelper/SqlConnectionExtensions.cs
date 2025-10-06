@@ -19,7 +19,7 @@ public static class SqlConnectionExtensions
     /// <param name="sqlTransaction">If this should be done in a specific transaction or not</param>
     /// <param name="cancellationToken">Do you like to have the option to cancel the operation?</param>
     /// <returns>Number of rows inserted</returns>
-    public static ValueTask<ulong> BulkInserAsync<T>(this SqlConnection connection, string tableName, IEnumerable<T> entities,
+    public static ValueTask<long> BulkInserAsync<T>(this SqlConnection connection, string tableName, IEnumerable<T> entities,
         int timeout = 30, SqlBulkCopyOptions sqlBulkCopyOptions = SqlBulkCopyOptions.Default, SqlTransaction? sqlTransaction = null, CancellationToken cancellationToken = default) where T : class
     {
         var helper = new SqlBulkCopyHelper<T>(tableName)
@@ -41,7 +41,7 @@ public static class SqlConnectionExtensions
     /// <param name="sqlTransaction">If this should be done in a specific transaction or not</param>
     /// <param name="cancellationToken">Do you like to have the option to cancel the operation?</param>
     /// <returns>Number of rows inserted</returns>
-    public static ValueTask<ulong> BulkInserAsync<T>(this SqlConnection connection, string tableName, string columnName, IEnumerable<T> values,
+    public static ValueTask<long> BulkInserAsync<T>(this SqlConnection connection, string tableName, string columnName, IEnumerable<T> values,
         int timeout = 30, SqlBulkCopyOptions sqlBulkCopyOptions = SqlBulkCopyOptions.Default, SqlTransaction? sqlTransaction = null, CancellationToken cancellationToken = default) where T : struct
     {
         var helper = new SqlBulkCopyHelper<T>(tableName)

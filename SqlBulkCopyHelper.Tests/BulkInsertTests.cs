@@ -38,7 +38,7 @@ public class BulkInsertTests(MsSqlFixture fixture) : IClassFixture<MsSqlFixture>
     {
         var helper = new SqlBulkCopyHelper<TestData>("#Test")
             .UseBracketQuoting()
-            .Map("This should works as column namen, when using brackets",
+            .Map("This should works as column name, when using brackets",
                 x => x.BoolColumn ? x.IntColumn * 2 : x.IntColumn);
         
         const int nrOrRows = 15;

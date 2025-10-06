@@ -2,7 +2,7 @@
 
 namespace SqlBulkCopyHelper.Tests;
 
-public class DisguisedDataReaderTest
+public class DisguisedDataReaderTests
 {
     [Fact]
     public void ReaderTest()
