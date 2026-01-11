@@ -157,9 +157,9 @@ public class SqlBulkCopyHelper<TEntity>
     /// <summary>
     /// Get information about the columns that currently exists in this helper.
     /// </summary>
-    /// <param name="columnsArAlwaysNullable">If true all the SchemaDefinition will be nullable. If false it will be based on if the Type that was provided during mapping is nullable or not.</param>
+    /// <param name="columnsAreAlwaysNullable">If true all the SchemaDefinition will be nullable. If false it will be based on if the Type that was provided during mapping is nullable or not.</param>
     /// <returns>SqlBulkCopyHelperColumnInfo</returns>
-    public IEnumerable<SqlBulkCopyHelperColumnInfo> GetColumnInfo(bool columnsArAlwaysNullable = true)
+    public IEnumerable<SqlBulkCopyHelperColumnInfo> GetColumnInfo(bool columnsAreAlwaysNullable = true)
     {
         var sb = new StringBuilder();
         foreach (var columnDefinition in _columnDefinitions)
@@ -174,7 +174,7 @@ public class SqlBulkCopyHelper<TEntity>
             
             sb.Append(' ').Append(columnType);
 
-            if (!columnsArAlwaysNullable && !columnDefinition.Nullable)
+            if (!columnsAreAlwaysNullable && !columnDefinition.Nullable)
             {
                 sb.Append(" not");
             }
@@ -193,15 +193,15 @@ public class SqlBulkCopyHelper<TEntity>
     /// <summary>
     /// This is more for creating a staging table.
     /// </summary>
-    /// <param name="columnsArAlwaysNullable">If true all columns will be nullable. If false it will be based on if the Type that was provided during mapping is nullable or not.</param>
+    /// <param name="columnsAreAlwaysNullable">If true all columns will be nullable. If false it will be based on if the Type that was provided during mapping is nullable or not.</param>
     /// <returns>A script that can be run against the database to create a staging table.</returns>
-    public string CreateTableScript(bool columnsArAlwaysNullable = true)
+    public string CreateTableScript(bool columnsAreAlwaysNullable = true)
     {
         var sb = new StringBuilder();
         sb.Append("create table ").AppendLine(string.Join(".", _tableName.Split('.').Select(QuoteName)));
         sb.AppendLine("(");
 
-        var columns = GetColumnInfo(columnsArAlwaysNullable).Select(x => x.SchemaDefinition).ToList();
+        var columns = GetColumnInfo(columnsAreAlwaysNullable).Select(x => x.SchemaDefinition).ToList();
 
         for (var i = 0; i < columns.Count; i++)
         {
