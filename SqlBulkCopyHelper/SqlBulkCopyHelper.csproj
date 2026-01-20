@@ -4,7 +4,24 @@
         <TargetFramework>netstandard2.0</TargetFramework>
         <Nullable>enable</Nullable>
         <LangVersion>default</LangVersion>
+        
+        <PackageId>torenius.SqlBulkCopyHelper</PackageId>
+        <Version>0.1</Version>
+        <Authors>Tommy Torenius</Authors>
+        <Description>
+            This library makes it possible to use IEnumerable together with SqlBulkCopy, by wrapping the list of values in a DataReader.
+            This makes it possible to stream insert data and drastically reduce the memory footprint.
+        </Description>
+        <PackageLicenseExpression>MIT</PackageLicenseExpression>
+        <RepositoryUrl>https://github.com/torenius/SqlBulkCopyHelper</RepositoryUrl>
+        <RepositoryType>git</RepositoryType>
+        <PackageTags>SqlBulkCopy;DbDataReader</PackageTags>
+        <PackageReadmeFile>README.md</PackageReadmeFile>
     </PropertyGroup>
+
+    <ItemGroup>
+        <None Include="README.md" Pack="true" PackagePath="\" />
+    </ItemGroup>
 
     <ItemGroup>
       <PackageReference Include="Microsoft.Data.SqlClient" Version="5.2.3" />

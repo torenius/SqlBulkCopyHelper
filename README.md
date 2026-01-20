@@ -1,12 +1,16 @@
 # SqlBulkCopyHelper
-This library makes it possible to use IEnumerable<T> together with SqlBulkCopy, by wrapping the list of values in a DataReader.  
+This library makes it possible to use IEnumerable<T> together with [SqlBulkCopy](https://learn.microsoft.com/en-us/dotnet/api/system.data.sqlclient.sqlbulkcopy), by wrapping the list of values in a DataReader.  
 This makes it possible to stream insert data and drastically reduce the memory footprint.
 
 It's inspired by its Postgres counterpart [PostgreSQLCopyHelper](https://github.com/PostgreSQLCopyHelper/PostgreSQLCopyHelper)
 
 ## Installing
 
-ToDo
+To install SqlBulkCopyHelper, run the following command in the Package Manager Console:
+
+```
+PM> Install-Package SqlBulkCopyHelper
+```
 
 ## Basic Usage
 
