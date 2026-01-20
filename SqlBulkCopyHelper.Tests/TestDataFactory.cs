@@ -44,7 +44,7 @@ public class TestData
 {
     public bool BoolColumn { get; set; }
     public byte ByteColumn { get; set; }
-    public byte[] ByteArrayColumn{ get; set; }
+    public required byte[] ByteArrayColumn{ get; set; }
     public short ShortColumn { get; set; }
     public int IntColumn { get; set; }
     public long LongColumn { get; set; }
@@ -52,7 +52,7 @@ public class TestData
     public double DoubleColumn { get; set; }
     public DateTime DateTimeColumn { get; set; }
     public Guid GuidColumn { get; set; }
-    public string StringColumn { get; set; }
+    public string? StringColumn { get; set; }
     public int? NullableIntColumn { get; set; }
     public char CharColumn { get; set; }
 }

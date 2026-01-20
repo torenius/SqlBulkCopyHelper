@@ -7,7 +7,7 @@ public class DataTableTests
     private class Test
     {
         public int Id { get; set; }
-        public string Name { get; set; }
+        public required string Name { get; set; }
     }
     
     [Fact]
