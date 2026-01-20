@@ -53,12 +53,13 @@ public class SqlBulkCopyHelper<TEntity>
     /// </summary>
     /// <param name="connection">SqlConnection to connect to. If It's closed, this code will open it, do the insert then close it. If it was open it will be kept open</param>
     /// <param name="entities">All the entities that will be inserted</param>
+    /// <param name="createTableIfNotExists">If true it will first make a call to creating the table that "CreateTableScript" generates</param>
     /// <param name="timeout">Number of seconds for the operation to complete before it times out. 0 equals no timeout. Default 30 seconds</param>
     /// <param name="sqlBulkCopyOptions">Different options that SqlBulkCopy will consider</param>
     /// <param name="sqlTransaction">If this should be done in a specific transaction or not</param>
     /// <param name="cancellationToken">Do you like to have the option to cancel the operation?</param>
     /// <returns>Number of rows inserted</returns>
-    public async ValueTask<long> BulkInsertAsync(SqlConnection connection, IEnumerable<TEntity> entities,
+    public async ValueTask<long> BulkInsertAsync(SqlConnection connection, IEnumerable<TEntity> entities, bool createTableIfNotExists = false,
         int timeout = 30, SqlBulkCopyOptions sqlBulkCopyOptions = SqlBulkCopyOptions.Default, SqlTransaction? sqlTransaction = null, CancellationToken cancellationToken = default)
     {
         if (cancellationToken.IsCancellationRequested)
@@ -96,6 +97,13 @@ public class SqlBulkCopyHelper<TEntity>
         foreach (var columnInfo in GetColumnInfo())
         {
             bulkCopy.ColumnMappings.Add(columnInfo.ColumnName, columnInfo.QuotedColumnName);
+        }
+
+        if (createTableIfNotExists)
+        {
+            var sqlCommand = connection.CreateCommand();
+            sqlCommand.CommandText = CreateTableScript();
+            await sqlCommand.ExecuteNonQueryAsync(cancellationToken);
         }
         
         await bulkCopy.WriteToServerAsync(GetDataReader(entities), cancellationToken);
