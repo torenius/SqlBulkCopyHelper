@@ -5,7 +5,7 @@
         <Nullable>enable</Nullable>
         <LangVersion>default</LangVersion>
         
-        <PackageId>torenius.SqlBulkCopyHelper</PackageId>
+        <PackageId>SqlBulkCopyHelper</PackageId>
         <Version>0.1</Version>
         <Authors>Tommy Torenius</Authors>
         <Description>

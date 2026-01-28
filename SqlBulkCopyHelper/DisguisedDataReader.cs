@@ -31,8 +31,11 @@ internal class DisguisedDataReader<TEntity> : DbDataReader
 
     public override long GetBytes(int ordinal, long dataOffset, byte[]? buffer, int bufferOffset, int length)
     {
-        if(buffer is null) throw new ArgumentNullException(nameof(buffer));
-        if (GetValue(ordinal) is not IEnumerable<byte> data) return 0;
+        if(buffer is null)
+            throw new ArgumentNullException(nameof(buffer));
+        
+        if (GetValue(ordinal) is not IEnumerable<byte> data)
+            throw new Exception($"Ordinal {ordinal} is not a byte array!");
         
         long bytesRead = 0;
         foreach (var x in data.Skip((int)dataOffset).Take(length).Select((b, i) => new { b, i }))
@@ -47,8 +50,11 @@ internal class DisguisedDataReader<TEntity> : DbDataReader
 
     public override long GetChars(int ordinal, long dataOffset, char[]? buffer, int bufferOffset, int length)
     {
-        if(buffer is null) throw new ArgumentNullException(nameof(buffer));
-        if (GetValue(ordinal) is not IEnumerable<char> data) return 0;
+        if(buffer is null)
+            throw new ArgumentNullException(nameof(buffer));
+        
+        if (GetValue(ordinal) is not IEnumerable<char> data)
+            throw new Exception($"Ordinal {ordinal} is not a char array!");
         
         long charsRead = 0;
         foreach (var x in data.Skip((int)dataOffset).Take(length).Select((c, i) => new { c, i }))
