@@ -30,7 +30,7 @@ jobs:
         run: dotnet pack ${{ env.project_path }} --configuration Release --no-build --output out /p:PackageVersion=${{ github.event.release.tag_name }}
         
       - name: Upload nuget to release
-        run: gh release upload ${{ github.event.release.tag_name }} out/*.nupkg
+        run: gh release upload ${{ github.event.release.tag_name }} out/*
         env:
           GITHUB_TOKEN: ${{ github.TOKEN }}
         shell: bash
