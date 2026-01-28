@@ -31,3 +31,6 @@ jobs:
         
       - name: Upload nuget to release
         run: gh release upload ${{ github.event.release.tag_name }} out/SqlBulkCopyHelper.${{ github.event.release.tag_name }}.nupkg
+        env:
+          GITHUB_TOKEN: ${{ github.TOKEN }}
+          shell: bash
