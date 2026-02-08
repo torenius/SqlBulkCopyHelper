@@ -65,10 +65,14 @@ await connection.CloseAsync();
 ### Naming convention
 `MapAllPublicProperties` will default just use PropertyInfo.Name  
 You can change the behavior by providing a function.
-`helper.MapAllPublicProperties(propertyInfo => propertyInfo.Name.ToLower());`
+```csharp
+helper.MapAllPublicProperties(propertyInfo => propertyInfo.Name.ToLower());
+```
 
-Its also possible to use that function in SqlConnection extension.  
-`await connection.BulkInserAsync("#Test", testData, propertyInfo => propertyInfo.Name.ToLower());`
+It's also possible to use that function in the SqlConnection extension.
+```csharp
+await connection.BulkInserAsync("#Test", testData, propertyInfo => propertyInfo.Name.ToLower());
+```
 
 ## Do you own mapping
 There is a few mapping options, the simplest is just an expression:
