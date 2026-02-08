@@ -102,7 +102,7 @@ public class SqlBulkCopyHelper<TEntity>
         if (createTableIfNotExists)
         {
             var sqlCommand = connection.CreateCommand();
-            sqlCommand.CommandText = CreateTableScript();
+            sqlCommand.CommandText = CreateTableScript(checkIfTableExists:true);
             await sqlCommand.ExecuteNonQueryAsync(cancellationToken);
         }
         
@@ -202,11 +202,26 @@ public class SqlBulkCopyHelper<TEntity>
     /// This is more for creating a staging table.
     /// </summary>
     /// <param name="columnsAreAlwaysNullable">If true all columns will be nullable. If false it will be based on if the Type that was provided during mapping is nullable or not.</param>
+    /// <param name="checkIfTableExists">If true, adds an if-statement around the "create table"-statement, to check if it already exists or not</param>
     /// <returns>A script that can be run against the database to create a staging table.</returns>
-    public string CreateTableScript(bool columnsAreAlwaysNullable = true)
+    public string CreateTableScript(bool columnsAreAlwaysNullable = true, bool checkIfTableExists = false)
     {
         var sb = new StringBuilder();
-        sb.Append("create table ").AppendLine(string.Join(".", _tableName.Split('.').Select(QuoteName)));
+        var schemaTableName = string.Join(".", _tableName.Split('.').Select(QuoteName));
+        
+        if (checkIfTableExists)
+        {
+            sb.Append("IF OBJECT_ID('");
+            if (_tableName.Contains('#'))
+            {
+                sb.Append("tempdb..");
+            }
+            
+            sb.Append(schemaTableName).AppendLine("') IS NULL");
+            sb.AppendLine("BEGIN");
+        }
+        
+        sb.Append("CREATE TABLE ").AppendLine(schemaTableName);
         sb.AppendLine("(");
 
         var columns = GetColumnInfo(columnsAreAlwaysNullable).Select(x => x.SchemaDefinition).ToList();
@@ -224,6 +239,11 @@ public class SqlBulkCopyHelper<TEntity>
         }
         
         sb.AppendLine(");");
+
+        if (checkIfTableExists)
+        {
+            sb.AppendLine("END");
+        }
 
         return sb.ToString();
     }

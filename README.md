@@ -62,6 +62,14 @@ var result = connection.Query<TestData>("SELECT * FROM #Test").ToList(); // Here
 await connection.CloseAsync();
 ```
 
+### Naming convention
+`MapAllPublicProperties` will default just use PropertyInfo.Name  
+You can change the behavior by providing a function.
+`helper.MapAllPublicProperties(propertyInfo => propertyInfo.Name.ToLower());`
+
+Its also possible to use that function in SqlConnection extension.  
+`await connection.BulkInserAsync("#Test", testData, propertyInfo => propertyInfo.Name.ToLower());`
+
 ## Do you own mapping
 There is a few mapping options, the simplest is just an expression:
 ```csharp
@@ -114,7 +122,12 @@ var helper = new SqlBulkCopyHelper<TestData>("#Test")
     .MapProperties(properties);
 ```
 The PropertyType method will convert the properties to an expression and automatically choose the property name as the database column name.   
-If you like to define you own column name you have to use:
+If you like to define you own column name you could provide a naming funtion:
+```csharp
+var helper = new SqlBulkCopyHelper<TestData>("#Test")
+    .MapProperties(properties, propertyInfo => propertyInfo.Name.ToLower());
+```
+or the properties one by one
 ```csharp
 var helper = new SqlBulkCopyHelper<TestData>("#Test");
 var properties = typeof(TestData).GetProperties().Where(x => x.PropertyType == typeof(int));
@@ -123,7 +136,7 @@ foreach (var property in properties)
     helper.MapProperty(property, property.Name.ToLower());
 }
 ```
-My hope is that I added enough helper methods to make it easy to create you own extensions methods that fit you use case.
+I hope that I added enough helper methods to make it easy to create you own extensions methods that fit your use case.
 
 ## DisguisedDataReader.cs
 SqlBulkCopy only accept DataTable and DbDataReader for its input. DataTable forces you to load all the data into memory before inserting it into your database.
