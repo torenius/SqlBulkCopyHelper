@@ -37,7 +37,7 @@ jobs:
           user: ${{ secrets.NUGET_USER }}
           
       - name: NuGet push
-        run: dotnet nuget push out/* --api-key ${{steps.login.outputs.NUGET_API_KEY}} --source https://api.nuget.org/v3/index.json
+        run: dotnet nuget push out/*.nupkg --api-key ${{steps.login.outputs.NUGET_API_KEY}} --source https://api.nuget.org/v3/index.json
         
       - name: Upload nuget to release
         run: gh release upload ${{ github.event.release.tag_name }} out/*
