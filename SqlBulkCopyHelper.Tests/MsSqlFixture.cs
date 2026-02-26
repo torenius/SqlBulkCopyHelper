@@ -7,8 +7,8 @@ namespace SqlBulkCopyHelper.Tests;
 public sealed class MsSqlFixture(IMessageSink messageSink)
     : ContainerFixture<MsSqlBuilder, MsSqlContainer>(messageSink)
 {
-    protected override MsSqlBuilder Configure(MsSqlBuilder builder)
+    protected override MsSqlBuilder Configure()
     {
-        return builder.WithImage("mcr.microsoft.com/mssql/server:2022-latest");
+        return new MsSqlBuilder("mcr.microsoft.com/mssql/server:2022-latest");
     }
 }
