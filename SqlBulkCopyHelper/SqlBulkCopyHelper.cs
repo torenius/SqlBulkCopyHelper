@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Data;
 using System.Data.Common;
@@ -26,7 +26,7 @@ public class SqlBulkCopyHelper<TEntity>
         if (string.IsNullOrWhiteSpace(tableName)) throw new ArgumentNullException(nameof(tableName));
         _tableName = tableName;
     }
-    
+
     /// <summary>
     /// If you need to convert your list of entities to a DataReader
     /// </summary>
@@ -46,14 +46,14 @@ public class SqlBulkCopyHelper<TEntity>
         dt.Load(GetDataReader(entities));
         return dt;
     }
-    
+
     /// <summary>
     /// Helper method to make the call to SqlBulkCopy easier.
     /// You can do this step yourself by just getting the DataReader from this class.
     /// </summary>
-    /// <param name="connection">SqlConnection to connect to. If It's closed, this code will open it, do the insert then close it. If it was open it will be kept open</param>
+    /// <param name="connection">SqlConnection to connect to. If it's closed, this code will open it, do the insert then close it. If it was open it will be kept open.</param>
     /// <param name="entities">All the entities that will be inserted</param>
-    /// <param name="createTableIfNotExists">If true it will first make a call to creating the table that "CreateTableScript" generates</param>
+    /// <param name="createTableIfNotExists">If true it will first make a call to creating the table that "CreateTableScript" generates. The CREATE TABLE runs in the same transaction as the bulk insert if one is active.</param>
     /// <param name="timeout">Number of seconds for the operation to complete before it times out. 0 equals no timeout. Default 30 seconds</param>
     /// <param name="sqlBulkCopyOptions">Different options that SqlBulkCopy will consider</param>
     /// <param name="sqlTransaction">If this should be done in a specific transaction or not</param>
@@ -74,94 +74,106 @@ public class SqlBulkCopyHelper<TEntity>
             closeConnection = true;
         }
 
-        SqlBulkCopy bulkCopy;
         var commitTransaction = false;
-        if (sqlBulkCopyOptions == SqlBulkCopyOptions.Default && sqlTransaction is null)
+        if (sqlBulkCopyOptions != SqlBulkCopyOptions.Default && sqlTransaction is null)
         {
-            bulkCopy = new SqlBulkCopy(connection);
+            sqlTransaction = connection.BeginTransaction();
+            commitTransaction = true;
         }
-        else
+
+        long rowsCopied;
+        try
         {
-            if (sqlTransaction is null)
+            using var bulkCopy = sqlTransaction is not null
+                ? new SqlBulkCopy(connection, sqlBulkCopyOptions, sqlTransaction)
+                : new SqlBulkCopy(connection);
+
+            bulkCopy.DestinationTableName = string.Join(".", _tableName.Split('.').Select(QuoteName));
+            bulkCopy.BulkCopyTimeout = timeout;
+
+            foreach (var columnInfo in GetColumnInfo())
             {
-                sqlTransaction = connection.BeginTransaction();
-                commitTransaction = true;
+                bulkCopy.ColumnMappings.Add(columnInfo.ColumnName, columnInfo.QuotedColumnName);
             }
-            
-            bulkCopy = new SqlBulkCopy(connection, sqlBulkCopyOptions, sqlTransaction);
+
+            if (createTableIfNotExists)
+            {
+                using var sqlCommand = connection.CreateCommand();
+                sqlCommand.Transaction = sqlTransaction;
+                sqlCommand.CommandText = CreateTableScript(checkIfTableExists: true);
+                await sqlCommand.ExecuteNonQueryAsync(cancellationToken);
+            }
+
+            await bulkCopy.WriteToServerAsync(GetDataReader(entities), cancellationToken);
+            rowsCopied = bulkCopy.RowsCopied64;
+
+            if (commitTransaction)
+            {
+                sqlTransaction!.Commit();
+            }
         }
-        
-        bulkCopy.DestinationTableName = string.Join(".", _tableName.Split('.').Select(QuoteName));
-        bulkCopy.BulkCopyTimeout = timeout;
-        
-        foreach (var columnInfo in GetColumnInfo())
+        catch when (commitTransaction)
         {
-            bulkCopy.ColumnMappings.Add(columnInfo.ColumnName, columnInfo.QuotedColumnName);
+            sqlTransaction!.Rollback();
+            throw;
+        }
+        finally
+        {
+            if (closeConnection)
+            {
+                connection.Close();
+            }
         }
 
-        if (createTableIfNotExists)
-        {
-            var sqlCommand = connection.CreateCommand();
-            sqlCommand.CommandText = CreateTableScript(checkIfTableExists:true);
-            await sqlCommand.ExecuteNonQueryAsync(cancellationToken);
-        }
-        
-        await bulkCopy.WriteToServerAsync(GetDataReader(entities), cancellationToken);
-
-        if (commitTransaction)
-        {
-            sqlTransaction!.Commit();
-        }
-        
-        if (closeConnection)
-        {
-            connection.Close();
-        }
-
-        return bulkCopy.RowsCopied64;
+        return rowsCopied;
     }
-    
+
     /// <summary>
-    /// Can be used to add or change how Types are mapped for the value in SqlBulkCopyHelperColumnInfo.SchemaDefinition
+    /// Can be used to add or change how Types are mapped for the value in SqlBulkCopyHelperColumnInfo.SchemaDefinition.
     /// Intention is just to use these mappings for a staging table. They might be on the "bigger" side.
     /// </summary>
-    public Dictionary<Type, string> SchemaDefinitionMapping = new()
+    public Dictionary<Type, string> SchemaDefinitionMapping { get; set; } = new()
     {
-        {typeof(bool), "bit"},
-        {typeof(byte), "tinyint"},
-        {typeof(sbyte), "smallint"},
-        {typeof(short), "smallint"},
-        {typeof(ushort), "int"},
-        {typeof(int), "int"},
-        {typeof(uint), "bigint"},
-        {typeof(long), "bigint"},
-        {typeof(ulong), "bigint"},
-        {typeof(decimal), "numeric(38,15)"},
-        {typeof(double), "float"},
-        {typeof(DateTime), "datetime2(7)"},
-        {typeof(Guid), "uniqueidentifier"},
-        {typeof(string), "nvarchar(max)"},
-        {typeof(char), "nchar(1)"},
-        {typeof(char[]), "nvarchar(max)"},
-        {typeof(byte[]), "varbinary(max)"},
-        
-        {typeof(bool?), "bit"},
-        {typeof(byte?), "tinyint"},
-        {typeof(sbyte?), "smallint"},
-        {typeof(short?), "smallint"},
-        {typeof(ushort?), "int"},
-        {typeof(int?), "int"},
-        {typeof(uint?), "bigint"},
-        {typeof(long?), "bigint"},
-        {typeof(ulong?), "bigint"},
-        {typeof(decimal?), "numeric(38,15)"},
-        {typeof(double?), "float"},
-        {typeof(DateTime?), "datetime2(7)"},
-        {typeof(Guid?), "uniqueidentifier"},
-        {typeof(char?), "nchar(1)"},
+        { typeof(bool), "bit" },
+        { typeof(byte), "tinyint" },
+        { typeof(sbyte), "smallint" },
+        { typeof(short), "smallint" },
+        { typeof(ushort), "int" },
+        { typeof(int), "int" },
+        { typeof(uint), "bigint" },
+        { typeof(long), "bigint" },
+        { typeof(ulong), "bigint" },
+        { typeof(float), "real" },
+        { typeof(double), "float" },
+        { typeof(decimal), "numeric(38,15)" },
+        { typeof(DateTime), "datetime2(7)" },
+        { typeof(DateTimeOffset), "datetimeoffset(7)" },
+        { typeof(TimeSpan), "time(7)" },
+        { typeof(Guid), "uniqueidentifier" },
+        { typeof(string), "nvarchar(max)" },
+        { typeof(char), "nchar(1)" },
+        { typeof(char[]), "nvarchar(max)" },
+        { typeof(byte[]), "varbinary(max)" },
+
+        { typeof(bool?), "bit" },
+        { typeof(byte?), "tinyint" },
+        { typeof(sbyte?), "smallint" },
+        { typeof(short?), "smallint" },
+        { typeof(ushort?), "int" },
+        { typeof(int?), "int" },
+        { typeof(uint?), "bigint" },
+        { typeof(long?), "bigint" },
+        { typeof(ulong?), "bigint" },
+        { typeof(float?), "real" },
+        { typeof(double?), "float" },
+        { typeof(decimal?), "numeric(38,15)" },
+        { typeof(DateTime?), "datetime2(7)" },
+        { typeof(DateTimeOffset?), "datetimeoffset(7)" },
+        { typeof(TimeSpan?), "time(7)" },
+        { typeof(Guid?), "uniqueidentifier" },
+        { typeof(char?), "nchar(1)" },
     };
-    
-    /// <returns></returns>
+
     /// <summary>
     /// Get information about the columns that currently exists in this helper.
     /// </summary>
@@ -175,11 +187,15 @@ public class SqlBulkCopyHelper<TEntity>
             sb.Clear();
             sb.Append(QuoteName(columnDefinition.ColumnName));
 
-            if (!SchemaDefinitionMapping.TryGetValue(columnDefinition.Type, out var columnType))
+            var lookupType = columnDefinition.Type.IsEnum
+                ? Enum.GetUnderlyingType(columnDefinition.Type)
+                : columnDefinition.Type;
+
+            if (!SchemaDefinitionMapping.TryGetValue(lookupType, out var columnType))
             {
                 columnType = "nvarchar(max)";
             }
-            
+
             sb.Append(' ').Append(columnType);
 
             if (!columnsAreAlwaysNullable && !columnDefinition.Nullable)
@@ -208,7 +224,7 @@ public class SqlBulkCopyHelper<TEntity>
     {
         var sb = new StringBuilder();
         var schemaTableName = string.Join(".", _tableName.Split('.').Select(QuoteName));
-        
+
         if (checkIfTableExists)
         {
             sb.Append("IF OBJECT_ID('");
@@ -216,11 +232,11 @@ public class SqlBulkCopyHelper<TEntity>
             {
                 sb.Append("tempdb..");
             }
-            
+
             sb.Append(schemaTableName).AppendLine("') IS NULL");
             sb.AppendLine("BEGIN");
         }
-        
+
         sb.Append("CREATE TABLE ").AppendLine(schemaTableName);
         sb.AppendLine("(");
 
@@ -229,15 +245,15 @@ public class SqlBulkCopyHelper<TEntity>
         for (var i = 0; i < columns.Count; i++)
         {
             sb.Append('\t').Append(columns[i]);
-            
+
             if (i < columns.Count - 1)
             {
                 sb.Append(',');
             }
-            
+
             sb.AppendLine();
         }
-        
+
         sb.AppendLine(");");
 
         if (checkIfTableExists)
@@ -249,7 +265,7 @@ public class SqlBulkCopyHelper<TEntity>
     }
 
     /// <summary>
-    /// Adds a mapping rule where we can infer the type from the lamda.
+    /// Adds a mapping rule where we can infer the type from the lambda.
     /// </summary>
     /// <param name="columnName">Database column name</param>
     /// <param name="propertyGetter">Lambda for getting the value</param>
@@ -257,16 +273,11 @@ public class SqlBulkCopyHelper<TEntity>
     /// <returns>The SqlBulkCopyHelper so you can continue with the builder pattern</returns>
     public SqlBulkCopyHelper<TEntity> Map<TProperty>(string columnName, Func<TEntity, TProperty> propertyGetter)
     {
-        return AddOrUpdateColumn(new DisguisedColumnDefinition<TEntity>
-        {
-            ColumnName = columnName,
-            Type = typeof(TProperty),
-            PropertyGetter = (entity) => (object)propertyGetter(entity)!
-        });
+        return AddOrUpdateColumn(columnName, typeof(TProperty), entity => (object)propertyGetter(entity)!);
     }
-    
+
     /// <summary>
-    /// Adds a mapping rule where we can't infer the type from the lamda.
+    /// Adds a mapping rule where we can't infer the type from the lambda.
     /// </summary>
     /// <param name="columnName">Database column name</param>
     /// <param name="propertyGetter">Lambda for getting the value</param>
@@ -274,20 +285,14 @@ public class SqlBulkCopyHelper<TEntity>
     /// <returns>The SqlBulkCopyHelper so you can continue with the builder pattern</returns>
     public SqlBulkCopyHelper<TEntity> Map(string columnName, Func<TEntity, object> propertyGetter, Type propertyType)
     {
-        return AddOrUpdateColumn(new DisguisedColumnDefinition<TEntity>
-        {
-            ColumnName = columnName,
-            Type = propertyType,
-            PropertyGetter = (entity) => propertyGetter(entity)!
-        });
+        return AddOrUpdateColumn(columnName, propertyType, entity => propertyGetter(entity)!);
     }
 
     /// <summary>
     /// Mapping is basically a dictionary where the columnName is the key.
-    /// If you for some reason need to remove a mapping.
-    /// Use this method. 
+    /// If you for some reason need to remove a mapping, use this method.
     /// </summary>
-    /// <param name="columnName">Removes the mapping if it exits. It does not exist, nothing happen</param>
+    /// <param name="columnName">Removes the mapping if it exits. If it does not exist, nothing happens.</param>
     /// <returns>The SqlBulkCopyHelper so you can continue with the builder pattern</returns>
     public SqlBulkCopyHelper<TEntity> RemoveMap(string columnName)
     {
@@ -299,66 +304,40 @@ public class SqlBulkCopyHelper<TEntity>
 
         return this;
     }
-    
-    private SqlBulkCopyHelper<TEntity> AddOrUpdateColumn(DisguisedColumnDefinition<TEntity> disguisedColumnDefinition)
-    {
-        RemoveMap(disguisedColumnDefinition.ColumnName);
 
-        var underlyingType = Nullable.GetUnderlyingType(disguisedColumnDefinition.Type);
-        if (underlyingType is not null)
+    private SqlBulkCopyHelper<TEntity> AddOrUpdateColumn(string columnName, Type type, Func<TEntity, object> propertyGetter)
+    {
+        RemoveMap(columnName);
+
+        var underlyingType = Nullable.GetUnderlyingType(type);
+
+        _columnDefinitions.Add(new DisguisedColumnDefinition<TEntity>
         {
-            disguisedColumnDefinition.Type = underlyingType;
-            disguisedColumnDefinition.Nullable = true;
-        }
-        
-        _columnDefinitions.Add(disguisedColumnDefinition);
+            ColumnName = columnName,
+            Type = underlyingType ?? type,
+            Nullable = underlyingType is not null,
+            PropertyGetter = propertyGetter
+        });
 
         return this;
     }
 
     /// <summary>
-    /// Quote table and column namnes in brackets []
+    /// Wraps table and column names in brackets []
     /// </summary>
-    public SqlBulkCopyHelper<TEntity> UseBracketQuoting() => UseQuoting("[", "]");
-    
-    /// <summary>
-    /// Quote table and column names in quotation marks ""
-    /// </summary>
-    public SqlBulkCopyHelper<TEntity> UseQuotationMarkQuoting() => UseQuoting("\"", "\"");
-
-    /// <summary>
-    /// Quote table and column names.
-    /// </summary>
-    /// <param name="prefixQuote">If the name doesn't start with this value, add it during quoting stage.</param>
-    /// <param name="postfixQuote">If the name doesn't end with this value, add it during quoting stage.</param>
-    public SqlBulkCopyHelper<TEntity> UseQuoting(string prefixQuote, string postfixQuote)
+    public SqlBulkCopyHelper<TEntity> UseBracketQuoting()
     {
         _useQuoting = true;
-        _prefixQuote = prefixQuote;
-        _postfixQuote = postfixQuote;
         return this;
     }
-    
+
     private bool _useQuoting;
-    private string _prefixQuote = string.Empty;
-    private string _postfixQuote = string.Empty;
+    private static readonly SqlCommandBuilder _quoter = new() { QuotePrefix = "[", QuoteSuffix = "]" };
 
     private string QuoteName(string name)
     {
-        if (string.IsNullOrWhiteSpace(name)) throw new Exception("Can't map null or empty string");
+        if (string.IsNullOrWhiteSpace(name)) throw new ArgumentException("Can't quote a null or empty name", nameof(name));
 
-        if (!_useQuoting) return name;
-
-        if (!name.StartsWith(_prefixQuote))
-        {
-            name = _prefixQuote + name;
-        }
-
-        if (!name.EndsWith(_postfixQuote))
-        {
-            name += _postfixQuote;
-        }
-        
-        return name;
+        return _useQuoting ? _quoter.QuoteIdentifier(name) : name;
     }
 }

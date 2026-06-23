@@ -39,20 +39,20 @@ Then you could just use one of the extensions methods directly on an SqlConnecti
 ```csharp
 var testData = new List<TestData>(); // You can have it as a list in memory or get it as an IEnumerable from another source
 var connection = new SqlConnection("your connection string");
-var numberOfRowsInserted = await connection.BulkInserAsync("dbo.MyTable", testData); // This is a helper method that basically use .MapAllPublicProperties() as in the example below
+var numberOfRowsInserted = await connection.BulkInsertAsync("dbo.MyTable", testData); // This is a helper method that basically use .MapAllPublicProperties() as in the example below
 ```
 
 ## Save your data to a temptable for future processing
 ```csharp
 var helper = new SqlBulkCopyHelper<TestData>("#Test") // The name of the table you like to insert into
-            .MapAllPublicProperties() // Use the predifined mapping that maps all columns
+            .MapAllPublicProperties() // Use the predefined mapping that maps all columns
             .UseBracketQuoting() // To make sure that the create table script always add [] around the column names
-            .RemoveMap("LongColumn"); // Lets say we are not interessted in the LongColumn, but still like to use the automapping
+            .RemoveMap("LongColumn"); // Lets say we are not interested in the LongColumn, but still like to use the automapping
 
 await using var connection = new SqlConnection("your connection string");
 await connection.OpenAsync();
 
-var sql = helper.CreateTableScript(); // Created a "CREATE TABLE #Test" script with all the columns that was mapped
+var sql = helper.CreateTableScript(); // Creates a "CREATE TABLE #Test" script with all the columns that was mapped
 await connection.ExecuteAsync(sql);
 
 await helper.BulkInsertAsync(connection, testData);
@@ -71,7 +71,7 @@ helper.MapAllPublicProperties(propertyInfo => propertyInfo.Name.ToLower());
 
 It's also possible to use that function in the SqlConnection extension.
 ```csharp
-await connection.BulkInserAsync("#Test", testData, propertyInfo => propertyInfo.Name.ToLower());
+await connection.BulkInsertAsync("#Test", testData, propertyInfo => propertyInfo.Name.ToLower());
 ```
 
 ## Do you own mapping

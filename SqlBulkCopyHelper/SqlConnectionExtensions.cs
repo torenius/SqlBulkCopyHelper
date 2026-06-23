@@ -14,7 +14,7 @@ public static class SqlConnectionExtensions
     {
         /// <summary>
         /// Will try to bulk insert all the entities using SqlBulkCopy.
-        /// Mapping will be done by selecting all public properties and then assuming that there name matched with the database column namn.
+        /// Mapping will be done by selecting all public properties and then assuming that their names match the database column names.
         /// </summary>
         /// <param name="tableName">Table to insert data into</param>
         /// <param name="entities">Entities to insert</param>
@@ -25,7 +25,7 @@ public static class SqlConnectionExtensions
         /// <param name="sqlTransaction">If this should be done in a specific transaction or not</param>
         /// <param name="cancellationToken">Do you like to have the option to cancel the operation?</param>
         /// <returns>Number of rows inserted</returns>
-        public ValueTask<long> BulkInserAsync<T>(string tableName, IEnumerable<T> entities, Func<PropertyInfo, string>? columnNameFunc = null, bool createTableIfNotExists = false,
+        public ValueTask<long> BulkInsertAsync<T>(string tableName, IEnumerable<T> entities, Func<PropertyInfo, string>? columnNameFunc = null, bool createTableIfNotExists = false,
             int timeout = 30, SqlBulkCopyOptions sqlBulkCopyOptions = SqlBulkCopyOptions.Default, SqlTransaction? sqlTransaction = null, CancellationToken cancellationToken = default) where T : class
         {
             var helper = new SqlBulkCopyHelper<T>(tableName)
@@ -47,7 +47,7 @@ public static class SqlConnectionExtensions
         /// <param name="sqlTransaction">If this should be done in a specific transaction or not</param>
         /// <param name="cancellationToken">Do you like to have the option to cancel the operation?</param>
         /// <returns>Number of rows inserted</returns>
-        public ValueTask<long> BulkInserAsync<T>(string tableName, string columnName, IEnumerable<T> values, bool createTableIfNotExists = false,
+        public ValueTask<long> BulkInsertAsync<T>(string tableName, string columnName, IEnumerable<T> values, bool createTableIfNotExists = false,
             int timeout = 30, SqlBulkCopyOptions sqlBulkCopyOptions = SqlBulkCopyOptions.Default, SqlTransaction? sqlTransaction = null, CancellationToken cancellationToken = default) where T : struct
         {
             var helper = new SqlBulkCopyHelper<T>(tableName)
