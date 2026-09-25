@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Data;
 using System.Data.Common;
 using System.Linq;
+using System.Runtime.CompilerServices;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
@@ -44,6 +45,17 @@ public class SqlBulkCopyHelper<TEntity>
         new DisguisedDataReader<TEntity>(_columnDefinitions, entities);
 
     /// <summary>
+    /// If you need to convert your async stream of entities to a DataReader.
+    /// The reader must be read with ReadAsync, the synchronous Read throws NotSupportedException.
+    /// Dispose it with DisposeAsync, so the source is disposed without blocking.
+    /// </summary>
+    /// <param name="entities">Entities to convert</param>
+    /// <param name="cancellationToken">Passed to the source when it's enumerated</param>
+    /// <returns>DbDataReader that contains the mapped columns</returns>
+    public DbDataReader GetDataReader(IAsyncEnumerable<TEntity> entities, CancellationToken cancellationToken = default) =>
+        new AsyncDisguisedDataReader<TEntity>(_columnDefinitions, entities, cancellationToken);
+
+    /// <summary>
     /// If you need to convert your list of entities to a DataTable
     /// </summary>
     /// <param name="entities">Entities to convert</param>
@@ -68,8 +80,36 @@ public class SqlBulkCopyHelper<TEntity>
     /// <param name="sqlTransaction">If this should be done in a specific transaction or not. The caller is responsible for commit or rollback.</param>
     /// <param name="cancellationToken">Do you like to have the option to cancel the operation?</param>
     /// <returns>Number of rows inserted</returns>
-    public async ValueTask<long> BulkInsertAsync(SqlConnection connection, IEnumerable<TEntity> entities, bool createTableIfNotExists = false,
+    // Preferred over the IAsyncEnumerable overload for types that implement both, like an EF Core DbSet
+    [OverloadResolutionPriority(1)]
+    public ValueTask<long> BulkInsertAsync(SqlConnection connection, IEnumerable<TEntity> entities, bool createTableIfNotExists = false,
         int timeout = 30, SqlBulkCopyOptions sqlBulkCopyOptions = SqlBulkCopyOptions.Default, SqlTransaction? sqlTransaction = null, CancellationToken cancellationToken = default)
+    {
+        return BulkInsertCoreAsync(connection, () => GetDataReader(entities), createTableIfNotExists, timeout, sqlBulkCopyOptions, sqlTransaction, cancellationToken);
+    }
+
+    /// <summary>
+    /// Same as the IEnumerable overload, but streams the entities from an IAsyncEnumerable without blocking threads.
+    /// For example EF Core's AsAsyncEnumerable() or Dapper's QueryUnbufferedAsync().
+    /// A type that implements both IEnumerable and IAsyncEnumerable (like an EF Core DbSet) uses the IEnumerable overload, call .AsAsyncEnumerable() to use this one.
+    /// </summary>
+    /// <param name="connection">SqlConnection to connect to. If it's closed, this code will open it, do the insert then close it. If it was open it will be kept open.</param>
+    /// <param name="entities">All the entities that will be inserted</param>
+    /// <param name="createTableIfNotExists">If true it will first make a call to creating the table that "CreateTableScript" generates. The CREATE TABLE runs in the same transaction as the bulk insert.
+    /// If no sqlTransaction is provided, a transaction is started and committed by this method (unless SqlBulkCopyOptions.UseInternalTransaction is used).</param>
+    /// <param name="timeout">Number of seconds for the operation to complete before it times out. 0 equals no timeout. Default 30 seconds</param>
+    /// <param name="sqlBulkCopyOptions">Different options that SqlBulkCopy will consider</param>
+    /// <param name="sqlTransaction">If this should be done in a specific transaction or not. The caller is responsible for commit or rollback.</param>
+    /// <param name="cancellationToken">Cancels the operation. It's also passed to the source when it's enumerated.</param>
+    /// <returns>Number of rows inserted</returns>
+    public ValueTask<long> BulkInsertAsync(SqlConnection connection, IAsyncEnumerable<TEntity> entities, bool createTableIfNotExists = false,
+        int timeout = 30, SqlBulkCopyOptions sqlBulkCopyOptions = SqlBulkCopyOptions.Default, SqlTransaction? sqlTransaction = null, CancellationToken cancellationToken = default)
+    {
+        return BulkInsertCoreAsync(connection, () => GetDataReader(entities, cancellationToken), createTableIfNotExists, timeout, sqlBulkCopyOptions, sqlTransaction, cancellationToken);
+    }
+
+    private async ValueTask<long> BulkInsertCoreAsync(SqlConnection connection, Func<DbDataReader> createReader, bool createTableIfNotExists,
+        int timeout, SqlBulkCopyOptions sqlBulkCopyOptions, SqlTransaction? sqlTransaction, CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
 
@@ -121,7 +161,7 @@ public class SqlBulkCopyHelper<TEntity>
 
                 _configureBulkCopy?.Invoke(bulkCopy);
 
-                var reader = GetDataReader(entities);
+                var reader = createReader();
                 await using (reader.ConfigureAwait(false))
                 {
                     await bulkCopy.WriteToServerAsync(reader, cancellationToken).ConfigureAwait(false);

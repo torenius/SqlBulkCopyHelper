@@ -118,6 +118,28 @@ The table name can be a multipart name like `dbo.MyTable`, and the parts can alr
 
 The SqlConnection extensions always use bracket quoting.
 
+## Streaming from IAsyncEnumerable
+`BulkInsertAsync` also accepts an `IAsyncEnumerable<T>`, so you can stream rows from an async source without blocking threads.
+SqlBulkCopy reads the next row with `ReadAsync`, which waits for the source asynchronously.
+
+```csharp
+// EF Core
+await helper.BulkInsertAsync(connection, dbContext.Orders.AsNoTracking().AsAsyncEnumerable());
+
+// Dapper
+await helper.BulkInsertAsync(connection, sourceConnection.QueryUnbufferedAsync<Order>("SELECT * FROM Orders"));
+
+// The SqlConnection extensions work the same way
+await connection.BulkInsertAsync("dbo.Orders", orders);
+await connection.BulkInsertAsync("#Ids", "Id", ids);
+```
+
+The `cancellationToken` is also passed to the source when it's enumerated, so an `async` iterator with `[EnumeratorCancellation]` gets it.
+
+Types that implement both `IEnumerable<T>` and `IAsyncEnumerable<T>`, like an EF Core `DbSet<T>` or query, use the `IEnumerable<T>` overload, the same as before. Call `.AsAsyncEnumerable()` to stream them asynchronously.
+
+If you use `GetDataReader(IAsyncEnumerable<T>)` yourself, read it with `ReadAsync` and dispose it with `DisposeAsync`. The synchronous `Read`, `GetEnumerator` and `HasRows` before the first `ReadAsync` throw `NotSupportedException`. There is no `GetDataTable` for an `IAsyncEnumerable`, since a DataTable is loaded synchronously and holds everything in memory anyway.
+
 ## Do your own mapping
 There are a few mapping options, the simplest is just an expression:
 ```csharp

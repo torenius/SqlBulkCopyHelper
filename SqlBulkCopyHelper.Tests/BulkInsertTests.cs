@@ -4,7 +4,7 @@ using Shouldly;
 
 namespace SqlBulkCopyHelper.Tests;
 
-public class BulkInsertTests(MsSqlFixture fixture) : IClassFixture<MsSqlFixture>
+public partial class BulkInsertTests(MsSqlFixture fixture) : IClassFixture<MsSqlFixture>
 {
     private readonly string _connectionString = fixture.Container.GetConnectionString();
     
