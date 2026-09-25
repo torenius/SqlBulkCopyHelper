@@ -17,18 +17,22 @@ namespace SqlBulkCopyHelper;
 public class SqlBulkCopyHelper<TEntity>
 {
     private readonly string _tableName;
+    private readonly List<string> _tableNameParts;
     private readonly List<DisguisedColumnDefinition<TEntity>> _columnDefinitions = [];
 
     /// <summary>
     /// Helper class easier and more memory efficient do a bulk insert of x amount of rows.
     /// You need to call .Map or other methods to map what values should be inserted and to what column names
     /// </summary>
-    /// <param name="tableName">The table to insert to. Could be the main table or a staging/temp table</param>
+    /// <param name="tableName">The table to insert to. Could be the main table or a staging/temp table.
+    /// Can be a multipart name like "dbo.Table", and parts can already be quoted like "[dbo].[My.Table]".</param>
     /// <exception cref="ArgumentNullException">If table name is null or empty it will throw</exception>
+    /// <exception cref="ArgumentException">If table name has a quoted part that is not terminated, like "[dbo.Table"</exception>
     public SqlBulkCopyHelper(string tableName)
     {
         if (string.IsNullOrWhiteSpace(tableName)) throw new ArgumentNullException(nameof(tableName));
         _tableName = tableName;
+        _tableNameParts = SplitMultipartName(tableName);
     }
 
     /// <summary>
@@ -104,12 +108,13 @@ public class SqlBulkCopyHelper<TEntity>
                 }
 
                 using var bulkCopy = new SqlBulkCopy(connection, sqlBulkCopyOptions, transaction);
-                bulkCopy.DestinationTableName = string.Join(".", _tableName.Split('.').Select(QuoteName));
+                bulkCopy.DestinationTableName = GetTableName();
                 bulkCopy.BulkCopyTimeout = timeout;
 
-                foreach (var columnInfo in GetColumnInfo())
+                // Not using GetColumnInfo, since the insert doesn't need a SchemaDefinitionMapping for the types
+                foreach (var columnDefinition in _columnDefinitions)
                 {
-                    bulkCopy.ColumnMappings.Add(columnInfo.ColumnName, columnInfo.QuotedColumnName);
+                    bulkCopy.ColumnMappings.Add(columnDefinition.ColumnName, QuoteName(columnDefinition.ColumnName));
                 }
 
                 _configureBulkCopy?.Invoke(bulkCopy);
@@ -183,6 +188,7 @@ public class SqlBulkCopyHelper<TEntity>
     /// </summary>
     /// <param name="columnsAreAlwaysNullable">If true all the SchemaDefinition will be nullable. If false it will be based on if the Type that was provided during mapping is nullable or not.</param>
     /// <returns>SqlBulkCopyHelperColumnInfo</returns>
+    /// <exception cref="InvalidOperationException">If a mapped type has no mapping in SchemaDefinitionMapping</exception>
     public IEnumerable<SqlBulkCopyHelperColumnInfo> GetColumnInfo(bool columnsAreAlwaysNullable = true)
     {
         var sb = new StringBuilder();
@@ -197,7 +203,9 @@ public class SqlBulkCopyHelper<TEntity>
 
             if (!SchemaDefinitionMapping.TryGetValue(lookupType, out var columnType))
             {
-                columnType = "nvarchar(max)";
+                throw new InvalidOperationException(
+                    $"Column '{columnDefinition.ColumnName}' has type '{lookupType}' that has no database type in SchemaDefinitionMapping. " +
+                    $"Add it, for example: helper.SchemaDefinitionMapping[typeof({lookupType.Name})] = \"nvarchar(max)\";");
             }
 
             sb.Append(' ').Append(columnType);
@@ -224,20 +232,20 @@ public class SqlBulkCopyHelper<TEntity>
     /// <param name="columnsAreAlwaysNullable">If true all columns will be nullable. If false it will be based on if the Type that was provided during mapping is nullable or not.</param>
     /// <param name="checkIfTableExists">If true, adds an if-statement around the "create table"-statement, to check if it already exists or not</param>
     /// <returns>A script that can be run against the database to create a staging table.</returns>
+    /// <exception cref="InvalidOperationException">If a mapped type has no mapping in SchemaDefinitionMapping</exception>
     public string CreateTableScript(bool columnsAreAlwaysNullable = true, bool checkIfTableExists = false)
     {
         var sb = new StringBuilder();
-        var schemaTableName = string.Join(".", _tableName.Split('.').Select(QuoteName));
+        var schemaTableName = GetTableName();
 
         if (checkIfTableExists)
         {
-            sb.Append("IF OBJECT_ID('");
-            if (_tableName.Contains('#'))
-            {
-                sb.Append("tempdb..");
-            }
+            var objectName = _tableNameParts.Count == 1 && Unquote(_tableNameParts[0]).StartsWith('#')
+                ? "tempdb.." + schemaTableName
+                : schemaTableName;
 
-            sb.Append(schemaTableName).AppendLine("') IS NULL");
+            // Escape ' since the name is used in a string literal
+            sb.Append("IF OBJECT_ID('").Append(objectName.Replace("'", "''")).AppendLine("') IS NULL");
             sb.AppendLine("BEGIN");
         }
 
@@ -358,12 +366,93 @@ public class SqlBulkCopyHelper<TEntity>
 
     private Action<SqlBulkCopy>? _configureBulkCopy;
     private bool _useQuoting;
-    private static readonly SqlCommandBuilder _quoter = new() { QuotePrefix = "[", QuoteSuffix = "]" };
 
     private string QuoteName(string name)
     {
         if (string.IsNullOrWhiteSpace(name)) throw new ArgumentException("Can't quote a null or empty name", nameof(name));
 
-        return _useQuoting ? _quoter.QuoteIdentifier(name) : name;
+        return _useQuoting ? Quote(name) : name;
+    }
+
+    /// <summary>
+    /// With quoting, each part is quoted. Parts that already are quoted are kept as they are.
+    /// Without quoting, the table name is used as it was provided.
+    /// Empty parts (like in "db..Table") are kept empty.
+    /// </summary>
+    private string GetTableName() =>
+        string.Join(".", _tableNameParts.Select(part => _useQuoting && part.Length > 0 ? Quote(Unquote(part)) : part));
+
+    private static string Quote(string name) => "[" + name.Replace("]", "]]") + "]";
+
+    private static string Unquote(string part)
+    {
+        if (part.Length >= 2 && part[0] == '[' && part[^1] == ']')
+        {
+            return part[1..^1].Replace("]]", "]");
+        }
+
+        if (part.Length >= 2 && part[0] == '"' && part[^1] == '"')
+        {
+            return part[1..^1].Replace("\"\"", "\"");
+        }
+
+        return part;
+    }
+
+    /// <summary>
+    /// Splits "db.[dbo].[My.Table]" into "db", "[dbo]" and "[My.Table]". A dot inside [] or "" is part of the name.
+    /// </summary>
+    private static List<string> SplitMultipartName(string name)
+    {
+        var parts = new List<string>();
+        var current = new StringBuilder();
+        char? closingQuote = null;
+
+        for (var i = 0; i < name.Length; i++)
+        {
+            var c = name[i];
+
+            if (closingQuote is not null)
+            {
+                current.Append(c);
+                if (c != closingQuote)
+                {
+                    continue;
+                }
+
+                // ]] inside [] (or "" inside "") is an escaped quote and not the end of the part
+                if (i + 1 < name.Length && name[i + 1] == closingQuote)
+                {
+                    current.Append(name[++i]);
+                }
+                else
+                {
+                    closingQuote = null;
+                }
+            }
+            else if (c == '.')
+            {
+                parts.Add(current.ToString());
+                current.Clear();
+            }
+            else
+            {
+                closingQuote = c switch
+                {
+                    '[' => ']',
+                    '"' => '"',
+                    _ => null
+                };
+                current.Append(c);
+            }
+        }
+
+        if (closingQuote is not null)
+        {
+            throw new ArgumentException($"Table name '{name}' has a quoted part that is not terminated.", nameof(name));
+        }
+
+        parts.Add(current.ToString());
+        return parts;
     }
 }

@@ -277,6 +277,57 @@ public class BulkInsertTests(MsSqlFixture fixture) : IClassFixture<MsSqlFixture>
         result.ShouldBeEquivalentTo(testData);
     }
 
+    [Fact]
+    public async Task BulkInsert_QuotedTableNameWithDotAndApostrophe()
+    {
+        var tableName = $"dbo.[Test.O'Brien_{Guid.NewGuid():N}]";
+        var helper = new SqlBulkCopyHelper<int>(tableName)
+            .UseBracketQuoting()
+            .Map("IntColumn");
+
+        await using var connection = new SqlConnection(_connectionString);
+        await connection.OpenAsync(TestContext.Current.CancellationToken);
+
+        // Twice, so the second call has to find the existing table with OBJECT_ID
+        await helper.BulkInsertAsync(connection, Enumerable.Range(1, 5), createTableIfNotExists: true, cancellationToken: TestContext.Current.CancellationToken);
+        await helper.BulkInsertAsync(connection, Enumerable.Range(1, 5), createTableIfNotExists: true, cancellationToken: TestContext.Current.CancellationToken);
+
+        (await connection.ExecuteScalarAsync<int>($"SELECT COUNT(*) FROM {tableName}")).ShouldBe(10);
+    }
+
+    [Fact]
+    public async Task BulkInsert_QuotedTempTable_CreateTableIfNotExistsTwice()
+    {
+        var helper = new SqlBulkCopyHelper<int>("#Test")
+            .UseBracketQuoting()
+            .Map("IntColumn");
+
+        await using var connection = new SqlConnection(_connectionString);
+        await connection.OpenAsync(TestContext.Current.CancellationToken);
+
+        await helper.BulkInsertAsync(connection, Enumerable.Range(1, 5), createTableIfNotExists: true, cancellationToken: TestContext.Current.CancellationToken);
+        await helper.BulkInsertAsync(connection, Enumerable.Range(1, 5), createTableIfNotExists: true, cancellationToken: TestContext.Current.CancellationToken);
+
+        (await connection.ExecuteScalarAsync<int>("SELECT COUNT(*) FROM #Test")).ShouldBe(10);
+    }
+
+    [Fact]
+    public async Task BulkInsert_TypeWithoutSchemaDefinitionMapping_WorksWithoutCreateTable()
+    {
+        // SqlBulkCopy supports SqlTypes, even if there is no SchemaDefinitionMapping for them
+        var helper = new SqlBulkCopyHelper<int>("#Test")
+            .Map("IntColumn", x => new System.Data.SqlTypes.SqlInt32(x));
+
+        await using var connection = new SqlConnection(_connectionString);
+        await connection.OpenAsync(TestContext.Current.CancellationToken);
+        await connection.ExecuteAsync("CREATE TABLE #Test (IntColumn int)");
+
+        var rows = await helper.BulkInsertAsync(connection, Enumerable.Range(1, 5), cancellationToken: TestContext.Current.CancellationToken);
+
+        rows.ShouldBe(5);
+        (await connection.ExecuteScalarAsync<int>("SELECT SUM(IntColumn) FROM #Test")).ShouldBe(15);
+    }
+
     private static IEnumerable<T> Track<T>(IEnumerable<T> source, Action onDispose)
     {
         try
