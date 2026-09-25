@@ -288,6 +288,11 @@ public class SqlBulkCopyHelper<TEntity>
         return AddOrUpdateColumn(columnName, propertyType, entity => propertyGetter(entity)!);
     }
 
+    internal SqlBulkCopyHelper<TEntity> Map(string columnName, Func<TEntity, object> propertyGetter, Type propertyType, bool nullable)
+    {
+        return AddOrUpdateColumn(columnName, propertyType, propertyGetter, nullable);
+    }
+
     /// <summary>
     /// Mapping is basically a dictionary where the columnName is the key.
     /// If you for some reason need to remove a mapping, use this method.
@@ -305,7 +310,8 @@ public class SqlBulkCopyHelper<TEntity>
         return this;
     }
 
-    private SqlBulkCopyHelper<TEntity> AddOrUpdateColumn(string columnName, Type type, Func<TEntity, object> propertyGetter)
+    /// <param name="nullable">If null, reference types and Nullable&lt;T&gt; are considered nullable</param>
+    private SqlBulkCopyHelper<TEntity> AddOrUpdateColumn(string columnName, Type type, Func<TEntity, object> propertyGetter, bool? nullable = null)
     {
         RemoveMap(columnName);
 
@@ -315,7 +321,7 @@ public class SqlBulkCopyHelper<TEntity>
         {
             ColumnName = columnName,
             Type = underlyingType ?? type,
-            Nullable = underlyingType is not null,
+            Nullable = nullable ?? (underlyingType is not null || !type.IsValueType),
             PropertyGetter = propertyGetter
         });
 

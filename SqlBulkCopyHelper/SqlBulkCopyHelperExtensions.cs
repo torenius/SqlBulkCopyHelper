@@ -82,7 +82,11 @@ public static class SqlBulkCopyHelperExtensions
             var convert = Expression.Convert(prop, typeof(object));
             var lambda = Expression.Lambda<Func<T, object>>(convert, instance).Compile();
 
-            helper.Map(columnName!, lambda, property.PropertyType);
+            // Respects nullable reference type annotations, "string" is not null and "string?" is nullable.
+            // If the property is not annotated (nullable context disabled) it's considered nullable.
+            var nullable = new NullabilityInfoContext().Create(property).ReadState != NullabilityState.NotNull;
+
+            helper.Map(columnName!, lambda, property.PropertyType, nullable);
         
             return helper;
         }

@@ -180,4 +180,66 @@ public class DataTableTests
         
         dt.Rows.Count.ShouldBe(nrOrRows);
     }
+
+    private class NullableTest
+    {
+        public int Id { get; set; }
+        public required string Name { get; set; }
+        public string? Description { get; set; }
+        public byte[]? Data { get; set; }
+    }
+
+    [Fact]
+    public void DataTable_NullReferenceTypes_Map()
+    {
+        var helper = new SqlBulkCopyHelper<NullableTest>("Test")
+            .Map("Id", x => x.Id)
+            .Map("Description", x => x.Description)
+            .Map("Data", x => x.Data);
+
+        var rows = new List<NullableTest>
+        {
+            new() { Id = 1, Name = "A", Description = null, Data = null },
+            new() { Id = 2, Name = "B", Description = "Desc", Data = [1, 2] }
+        };
+
+        var dt = helper.GetDataTable(rows);
+
+        dt.Rows.Count.ShouldBe(2);
+        dt.Rows[0]["Description"].ShouldBe(DBNull.Value);
+        dt.Rows[0]["Data"].ShouldBe(DBNull.Value);
+        dt.Rows[1]["Description"].ShouldBe("Desc");
+    }
+
+    [Fact]
+    public void DataTable_NullReferenceTypes_MapAllPublicProperties()
+    {
+        var helper = new SqlBulkCopyHelper<NullableTest>("Test")
+            .MapAllPublicProperties();
+
+        var rows = new List<NullableTest>
+        {
+            new() { Id = 1, Name = "A", Description = null, Data = null }
+        };
+
+        var dt = helper.GetDataTable(rows);
+
+        dt.Rows.Count.ShouldBe(1);
+        dt.Rows[0]["Description"].ShouldBe(DBNull.Value);
+        dt.Rows[0]["Data"].ShouldBe(DBNull.Value);
+    }
+
+    [Fact]
+    public void CreateTableScript_RespectsNullableReferenceTypes()
+    {
+        var columns = new SqlBulkCopyHelper<NullableTest>("Test")
+            .MapAllPublicProperties()
+            .GetColumnInfo(columnsAreAlwaysNullable: false)
+            .ToDictionary(x => x.ColumnName, x => x.SchemaDefinition);
+
+        columns["Id"].ShouldBe("Id int not null");
+        columns["Name"].ShouldBe("Name nvarchar(max) not null");
+        columns["Description"].ShouldBe("Description nvarchar(max) null");
+        columns["Data"].ShouldBe("Data varbinary(max) null");
+    }
 }
