@@ -19,13 +19,13 @@ public class BulkInsertTests(MsSqlFixture fixture) : IClassFixture<MsSqlFixture>
         var testData = TestDataFactory.GetTestData(nrOrRows).ToList();
 
         await using var connection = new SqlConnection(_connectionString);
-        await connection.OpenAsync();
+        await connection.OpenAsync(TestContext.Current.CancellationToken);
 
         var sql = helper.CreateTableScript();
         await connection.ExecuteAsync(sql);
 
-        await helper.BulkInsertAsync(connection, testData);
-        
+        await helper.BulkInsertAsync(connection, testData, cancellationToken: TestContext.Current.CancellationToken);
+
         var result = connection.Query<TestData>("SELECT * FROM #Test").ToList();
 
         await connection.CloseAsync();
@@ -45,13 +45,13 @@ public class BulkInsertTests(MsSqlFixture fixture) : IClassFixture<MsSqlFixture>
         var testData = TestDataFactory.GetTestData(nrOrRows).ToList();
 
         await using var connection = new SqlConnection(_connectionString);
-        await connection.OpenAsync();
+        await connection.OpenAsync(TestContext.Current.CancellationToken);
 
         var sql = helper.CreateTableScript();
         await connection.ExecuteAsync(sql);
 
-        await helper.BulkInsertAsync(connection, testData);
-        
+        await helper.BulkInsertAsync(connection, testData, cancellationToken: TestContext.Current.CancellationToken);
+
         var result = connection.Query<int>("SELECT * FROM #Test").ToList();
 
         await connection.CloseAsync();
@@ -326,6 +326,79 @@ public class BulkInsertTests(MsSqlFixture fixture) : IClassFixture<MsSqlFixture>
 
         rows.ShouldBe(5);
         (await connection.ExecuteScalarAsync<int>("SELECT SUM(IntColumn) FROM #Test")).ShouldBe(15);
+    }
+
+    [Fact]
+    public async Task BulkInsert_AlreadyCancelled_DoesNotOpenConnection()
+    {
+        var helper = new SqlBulkCopyHelper<int>("#Test")
+            .Map("IntColumn");
+
+        await using var connection = new SqlConnection(_connectionString);
+
+        await Should.ThrowAsync<OperationCanceledException>(async () =>
+            await helper.BulkInsertAsync(connection, Enumerable.Range(1, 5), createTableIfNotExists: true, cancellationToken: new CancellationToken(canceled: true)));
+
+        connection.State.ShouldBe(System.Data.ConnectionState.Closed);
+    }
+
+    [Fact]
+    public async Task BulkInsert_CancelledDuringInsert_RollsBackAndClosesConnection()
+    {
+        var tableName = $"dbo.Test_{Guid.NewGuid():N}";
+        var helper = new SqlBulkCopyHelper<int>(tableName)
+            .Map("IntColumn")
+            .ConfigureBulkCopy(bulkCopy => bulkCopy.BatchSize = 10);
+
+        using var cts = CancellationTokenSource.CreateLinkedTokenSource(TestContext.Current.CancellationToken);
+        var values = Enumerable.Range(1, 10_000).Select(x =>
+        {
+            if (x == 100)
+            {
+                cts.Cancel();
+            }
+
+            return x;
+        });
+
+        await using var connection = new SqlConnection(_connectionString);
+
+        await Should.ThrowAsync<OperationCanceledException>(async () =>
+            await helper.BulkInsertAsync(connection, values, createTableIfNotExists: true, cancellationToken: cts.Token));
+
+        connection.State.ShouldBe(System.Data.ConnectionState.Closed);
+        (await connection.ExecuteScalarAsync<int?>($"SELECT OBJECT_ID('{tableName}')")).ShouldBeNull();
+    }
+
+    [Fact]
+    public async Task BulkInsert_SqlConnectionExtension_MapAllPublicProperties()
+    {
+        var testData = TestDataFactory.GetTestData(15).ToList();
+
+        await using var connection = new SqlConnection(_connectionString);
+        await connection.OpenAsync(TestContext.Current.CancellationToken);
+
+        var rows = await connection.BulkInsertAsync("#Test", testData, createTableIfNotExists: true,
+            cancellationToken: TestContext.Current.CancellationToken);
+
+        rows.ShouldBe(15);
+        var result = (await connection.QueryAsync<TestData>("SELECT * FROM #Test")).ToList();
+        result.ShouldBeEquivalentTo(testData);
+    }
+
+    [Fact]
+    public async Task BulkInsert_SqlConnectionExtension_ColumnNameFunc()
+    {
+        var testData = TestDataFactory.GetTestData(5).ToList();
+
+        await using var connection = new SqlConnection(_connectionString);
+        await connection.OpenAsync(TestContext.Current.CancellationToken);
+
+        await connection.BulkInsertAsync("#Test", testData, propertyInfo => "col_" + propertyInfo.Name, createTableIfNotExists: true,
+            cancellationToken: TestContext.Current.CancellationToken);
+
+        var ids = (await connection.QueryAsync<int>("SELECT col_IntColumn FROM #Test")).ToList();
+        ids.ShouldBe(testData.Select(x => x.IntColumn).ToList(), ignoreOrder: true);
     }
 
     private static IEnumerable<T> Track<T>(IEnumerable<T> source, Action onDispose)

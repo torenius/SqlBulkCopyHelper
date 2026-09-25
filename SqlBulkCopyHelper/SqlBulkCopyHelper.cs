@@ -71,18 +71,16 @@ public class SqlBulkCopyHelper<TEntity>
     public async ValueTask<long> BulkInsertAsync(SqlConnection connection, IEnumerable<TEntity> entities, bool createTableIfNotExists = false,
         int timeout = 30, SqlBulkCopyOptions sqlBulkCopyOptions = SqlBulkCopyOptions.Default, SqlTransaction? sqlTransaction = null, CancellationToken cancellationToken = default)
     {
-        if (cancellationToken.IsCancellationRequested)
-        {
-            return await new ValueTask<long>(Task.FromCanceled<long>(cancellationToken));
-        }
+        cancellationToken.ThrowIfCancellationRequested();
 
         var closeConnection = false;
         if (connection.State != ConnectionState.Open)
         {
-            await connection.OpenAsync(cancellationToken);
+            await connection.OpenAsync(cancellationToken).ConfigureAwait(false);
             closeConnection = true;
         }
 
+        SqlTransaction? ownTransaction = null;
         try
         {
             // CREATE TABLE and the bulk insert should succeed or fail together.
@@ -91,9 +89,10 @@ public class SqlBulkCopyHelper<TEntity>
                 && sqlTransaction is null
                 && !sqlBulkCopyOptions.HasFlag(SqlBulkCopyOptions.UseInternalTransaction);
 
-            await using var ownTransaction = useOwnTransaction
-                ? (SqlTransaction)await connection.BeginTransactionAsync(cancellationToken)
-                : null;
+            if (useOwnTransaction)
+            {
+                ownTransaction = (SqlTransaction)await connection.BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
+            }
 
             var transaction = sqlTransaction ?? ownTransaction;
 
@@ -101,10 +100,13 @@ public class SqlBulkCopyHelper<TEntity>
             {
                 if (createTableIfNotExists)
                 {
-                    await using var sqlCommand = connection.CreateCommand();
-                    sqlCommand.Transaction = transaction;
-                    sqlCommand.CommandText = CreateTableScript(checkIfTableExists: true);
-                    await sqlCommand.ExecuteNonQueryAsync(cancellationToken);
+                    var sqlCommand = connection.CreateCommand();
+                    await using (sqlCommand.ConfigureAwait(false))
+                    {
+                        sqlCommand.Transaction = transaction;
+                        sqlCommand.CommandText = CreateTableScript(checkIfTableExists: true);
+                        await sqlCommand.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+                    }
                 }
 
                 using var bulkCopy = new SqlBulkCopy(connection, sqlBulkCopyOptions, transaction);
@@ -119,12 +121,15 @@ public class SqlBulkCopyHelper<TEntity>
 
                 _configureBulkCopy?.Invoke(bulkCopy);
 
-                await using var reader = GetDataReader(entities);
-                await bulkCopy.WriteToServerAsync(reader, cancellationToken);
+                var reader = GetDataReader(entities);
+                await using (reader.ConfigureAwait(false))
+                {
+                    await bulkCopy.WriteToServerAsync(reader, cancellationToken).ConfigureAwait(false);
+                }
 
                 if (ownTransaction is not null)
                 {
-                    await ownTransaction.CommitAsync(cancellationToken);
+                    await ownTransaction.CommitAsync(cancellationToken).ConfigureAwait(false);
                 }
 
                 return bulkCopy.RowsCopied64;
@@ -133,7 +138,7 @@ public class SqlBulkCopyHelper<TEntity>
             {
                 try
                 {
-                    await ownTransaction.RollbackAsync(CancellationToken.None);
+                    await ownTransaction.RollbackAsync(CancellationToken.None).ConfigureAwait(false);
                 }
                 catch
                 {
@@ -145,9 +150,14 @@ public class SqlBulkCopyHelper<TEntity>
         }
         finally
         {
+            if (ownTransaction is not null)
+            {
+                await ownTransaction.DisposeAsync().ConfigureAwait(false);
+            }
+
             if (closeConnection)
             {
-                await connection.CloseAsync();
+                await connection.CloseAsync().ConfigureAwait(false);
             }
         }
     }
