@@ -26,14 +26,16 @@ internal class DisguisedDataReader<TEntity> : DbDataReader
 
     public DisguisedDataReader(List<DisguisedColumnDefinition<TEntity>> columnDefinitions, IEnumerable<TEntity> entities)
     {
-        _columnDefinitions = columnDefinitions;
+        // A copy, so changes to the helper's mapping don't affect a reader that has already been created
+        _columnDefinitions = [.. columnDefinitions];
         _enumerator = entities.GetEnumerator();
         _values = new object[_columnDefinitions.Count];
         _valueRow = new long[_columnDefinitions.Count];
 
+        // Column names are unique case-insensitively, see SqlBulkCopyHelper.RemoveMap
         _nameToIndex = _columnDefinitions
             .Select((x, i) => new { Name = x.ColumnName, Index = i })
-            .ToDictionary(x => x.Name, x => x.Index);
+            .ToDictionary(x => x.Name, x => x.Index, StringComparer.OrdinalIgnoreCase);
     }
 
     public override bool GetBoolean(int ordinal) => (bool)GetValue(ordinal);
@@ -111,21 +113,9 @@ internal class DisguisedDataReader<TEntity> : DbDataReader
 
     public override int GetOrdinal(string name)
     {
-        if (_nameToIndex.TryGetValue(name, out var index))
-        {
-            return index;
-        }
-
-        // Same as SqlDataReader, first a case-sensitive lookup and then case-insensitive
-        for (var i = 0; i < _columnDefinitions.Count; i++)
-        {
-            if (string.Equals(_columnDefinitions[i].ColumnName, name, StringComparison.OrdinalIgnoreCase))
-            {
-                return i;
-            }
-        }
-
-        throw new IndexOutOfRangeException($"Column '{name}' does not exist.");
+        return _nameToIndex.TryGetValue(name, out var index)
+            ? index
+            : throw new IndexOutOfRangeException($"Column '{name}' does not exist.");
     }
 
     public override string GetString(int ordinal) => (string)GetValue(ordinal);

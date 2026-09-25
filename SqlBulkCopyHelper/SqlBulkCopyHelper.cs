@@ -299,13 +299,14 @@ public class SqlBulkCopyHelper<TEntity>
 
     /// <summary>
     /// Mapping is basically a dictionary where the columnName is the key.
+    /// Column names are case-insensitive, like in SQL Server, so "Id" and "id" is the same column.
     /// If you for some reason need to remove a mapping, use this method.
     /// </summary>
     /// <param name="columnName">Removes the mapping if it exits. If it does not exist, nothing happens.</param>
     /// <returns>The SqlBulkCopyHelper so you can continue with the builder pattern</returns>
     public SqlBulkCopyHelper<TEntity> RemoveMap(string columnName)
     {
-        var columnDefinition = _columnDefinitions.FirstOrDefault(x => x.ColumnName == columnName);
+        var columnDefinition = _columnDefinitions.FirstOrDefault(x => string.Equals(x.ColumnName, columnName, StringComparison.OrdinalIgnoreCase));
         if (columnDefinition is not null)
         {
             _columnDefinitions.Remove(columnDefinition);
