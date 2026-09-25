@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections;
 using System.Collections.Generic;
 using System.Data;
@@ -10,16 +10,27 @@ namespace SqlBulkCopyHelper;
 internal class DisguisedDataReader<TEntity> : DbDataReader
 {
     private readonly List<DisguisedColumnDefinition<TEntity>> _columnDefinitions;
-    
-    private TEntity? _currentEntity;
-    private IEnumerator<TEntity>? _enumerator;
     private readonly Dictionary<string, int> _nameToIndex;
+
+    // Cached values for the current row. A PropertyGetter is only called when the column is read, and at most once per row.
+    private readonly object[] _values;
+    private readonly long[] _valueRow; // Which row the cached value belongs to
+    private long _currentRow; // 0 = no row has been read yet
+    private bool _hasCurrentRow;
+
+    private IEnumerator<TEntity>? _enumerator;
+
+    // HasRows needs to look at the first row before Read is called. The result is saved and used by the first Read.
+    private bool? _hasRows;
+    private bool _peekedFirstRow;
 
     public DisguisedDataReader(List<DisguisedColumnDefinition<TEntity>> columnDefinitions, IEnumerable<TEntity> entities)
     {
         _columnDefinitions = columnDefinitions;
         _enumerator = entities.GetEnumerator();
-        
+        _values = new object[_columnDefinitions.Count];
+        _valueRow = new long[_columnDefinitions.Count];
+
         _nameToIndex = _columnDefinitions
             .Select((x, i) => new { Name = x.ColumnName, Index = i })
             .ToDictionary(x => x.Name, x => x.Index);
@@ -31,38 +42,49 @@ internal class DisguisedDataReader<TEntity> : DbDataReader
 
     public override long GetBytes(int ordinal, long dataOffset, byte[]? buffer, int bufferOffset, int length)
     {
-        if(buffer is null)
-            throw new ArgumentNullException(nameof(buffer));
-        
-        if (GetValue(ordinal) is not IEnumerable<byte> data)
-            throw new Exception($"Ordinal {ordinal} is not a byte array!");
-        
-        long bytesRead = 0;
-        foreach (var x in data.Skip((int)dataOffset).Take(length).Select((b, i) => new { b, i }))
+        ReadOnlySpan<byte> data = GetValue(ordinal) switch
         {
-            buffer[bufferOffset + x.i] = x.b;
-            bytesRead++;
-        }
-        return bytesRead;
+            byte[] bytes => bytes,
+            IEnumerable<byte> bytes => bytes.ToArray(),
+            _ => throw new InvalidCastException($"Ordinal {ordinal} is not a byte array!")
+        };
+
+        return CopyTo(data, dataOffset, buffer, bufferOffset, length);
     }
 
     public override char GetChar(int ordinal) => (char)GetValue(ordinal);
 
     public override long GetChars(int ordinal, long dataOffset, char[]? buffer, int bufferOffset, int length)
     {
-        if(buffer is null)
-            throw new ArgumentNullException(nameof(buffer));
-        
-        if (GetValue(ordinal) is not IEnumerable<char> data)
-            throw new Exception($"Ordinal {ordinal} is not a char array!");
-        
-        long charsRead = 0;
-        foreach (var x in data.Skip((int)dataOffset).Take(length).Select((c, i) => new { c, i }))
+        ReadOnlySpan<char> data = GetValue(ordinal) switch
         {
-            buffer[bufferOffset + x.i] = x.c;
-            charsRead++;
+            string chars => chars,
+            char[] chars => chars,
+            IEnumerable<char> chars => chars.ToArray(),
+            _ => throw new InvalidCastException($"Ordinal {ordinal} is not a char array!")
+        };
+
+        return CopyTo(data, dataOffset, buffer, bufferOffset, length);
+    }
+
+    /// <summary>
+    /// Follows the DbDataReader contract for GetBytes and GetChars. If buffer is null the total length is returned.
+    /// </summary>
+    private static long CopyTo<T>(ReadOnlySpan<T> data, long dataOffset, T[]? buffer, int bufferOffset, int length)
+    {
+        if (buffer is null)
+        {
+            return data.Length;
         }
-        return charsRead;
+
+        if (dataOffset >= data.Length)
+        {
+            return 0;
+        }
+
+        var count = (int)Math.Min(length, data.Length - dataOffset);
+        data.Slice((int)dataOffset, count).CopyTo(buffer.AsSpan(bufferOffset));
+        return count;
     }
 
     public override string GetDataTypeName(int ordinal) => _columnDefinitions[ordinal].Type.Name;
@@ -87,30 +109,52 @@ internal class DisguisedDataReader<TEntity> : DbDataReader
 
     public override string GetName(int ordinal) => _columnDefinitions[ordinal].ColumnName;
 
-    public override int GetOrdinal(string name) => _nameToIndex[name];
+    public override int GetOrdinal(string name)
+    {
+        if (_nameToIndex.TryGetValue(name, out var index))
+        {
+            return index;
+        }
+
+        // Same as SqlDataReader, first a case-sensitive lookup and then case-insensitive
+        for (var i = 0; i < _columnDefinitions.Count; i++)
+        {
+            if (string.Equals(_columnDefinitions[i].ColumnName, name, StringComparison.OrdinalIgnoreCase))
+            {
+                return i;
+            }
+        }
+
+        throw new IndexOutOfRangeException($"Column '{name}' does not exist.");
+    }
 
     public override string GetString(int ordinal) => (string)GetValue(ordinal);
 
-    public override object GetValue(int ordinal) => _columnDefinitions[ordinal].PropertyGetter(_currentEntity!);
+    public override object GetValue(int ordinal)
+    {
+        if (!_hasCurrentRow) throw new InvalidOperationException("No data exists for the row. Call Read first.");
+
+        if (_valueRow[ordinal] != _currentRow)
+        {
+            _values[ordinal] = _columnDefinitions[ordinal].PropertyGetter(_enumerator!.Current) ?? DBNull.Value;
+            _valueRow[ordinal] = _currentRow;
+        }
+
+        return _values[ordinal];
+    }
 
     public override int GetValues(object[] values)
     {
-        var count = 0;
-        for (var i = 0; i < _columnDefinitions.Count && i < values.Length; i++)
+        var count = Math.Min(_values.Length, values.Length);
+        for (var i = 0; i < count; i++)
         {
-            values[i] = this[i];
-            count++;
+            values[i] = GetValue(i);
         }
 
         return count;
     }
 
-    public override bool IsDBNull(int ordinal)
-    {
-        var data = GetValue(ordinal);
-        // ReSharper disable once ConditionIsAlwaysTrueOrFalseAccordingToNullableAPIContract
-        return data is null || data == DBNull.Value;
-    }
+    public override bool IsDBNull(int ordinal) => GetValue(ordinal) is DBNull;
 
     public override int FieldCount => _columnDefinitions.Count;
 
@@ -119,7 +163,21 @@ internal class DisguisedDataReader<TEntity> : DbDataReader
     public override object this[string name] => GetValue(GetOrdinal(name));
 
     public override int RecordsAffected => -1;
-    public override bool HasRows => false;
+
+    public override bool HasRows
+    {
+        get
+        {
+            if (_hasRows is null && !IsClosed)
+            {
+                _hasRows = _enumerator!.MoveNext();
+                _peekedFirstRow = true;
+            }
+
+            return _hasRows ?? false;
+        }
+    }
+
     public override bool IsClosed => _enumerator == null;
 
     public override bool NextResult() => false;
@@ -127,19 +185,37 @@ internal class DisguisedDataReader<TEntity> : DbDataReader
     public override bool Read()
     {
         if (IsClosed) throw new InvalidOperationException("The reader is closed.");
-        
-        var state = _enumerator!.MoveNext();
-        _currentEntity = state ? _enumerator.Current : default(TEntity);
+
+        bool state;
+        if (_peekedFirstRow)
+        {
+            _peekedFirstRow = false;
+            state = _hasRows!.Value;
+        }
+        else
+        {
+            state = _enumerator!.MoveNext();
+            _hasRows ??= state;
+        }
+
+        _hasCurrentRow = state;
+        if (state)
+        {
+            // Invalidates all cached values, they will be fetched when they are read
+            _currentRow++;
+        }
+        else
+        {
+            Array.Clear(_values);
+        }
+
         return state;
     }
 
     public override int Depth => 0;
 
-    public override IEnumerator GetEnumerator()
-    {
-        throw new NotImplementedException();
-    }
-    
+    public override IEnumerator GetEnumerator() => new DbEnumerator(this);
+
     /// <summary>
     /// Used by DataTable.Load method
     /// </summary>
@@ -175,6 +251,7 @@ internal class DisguisedDataReader<TEntity> : DbDataReader
     {
         _enumerator?.Dispose();
         _enumerator = null;
-        _currentEntity = default(TEntity);
+        _hasCurrentRow = false;
+        Array.Clear(_values);
     }
 }

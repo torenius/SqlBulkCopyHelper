@@ -236,6 +236,47 @@ public class BulkInsertTests(MsSqlFixture fixture) : IClassFixture<MsSqlFixture>
         reader.IsDBNull(3).ShouldBeTrue();
     }
 
+    private enum IntEnum
+    {
+        A = 1,
+        B = 2
+    }
+
+    private enum ByteEnum : byte
+    {
+        X = 10,
+        Y = 20
+    }
+
+    private class EnumTest
+    {
+        public IntEnum IntEnumColumn { get; set; }
+        public ByteEnum ByteEnumColumn { get; set; }
+        public IntEnum? NullableIntEnumColumn { get; set; }
+    }
+
+    [Fact]
+    public async Task BulkInsert_Enums()
+    {
+        var helper = new SqlBulkCopyHelper<EnumTest>("#Test")
+            .MapAllPublicProperties();
+
+        var testData = new List<EnumTest>
+        {
+            new() { IntEnumColumn = IntEnum.A, ByteEnumColumn = ByteEnum.X, NullableIntEnumColumn = IntEnum.B },
+            new() { IntEnumColumn = IntEnum.B, ByteEnumColumn = ByteEnum.Y, NullableIntEnumColumn = null }
+        };
+
+        await using var connection = new SqlConnection(_connectionString);
+        await connection.OpenAsync(TestContext.Current.CancellationToken);
+
+        await helper.BulkInsertAsync(connection, testData, createTableIfNotExists: true, cancellationToken: TestContext.Current.CancellationToken);
+
+        var result = (await connection.QueryAsync<EnumTest>("SELECT * FROM #Test ORDER BY IntEnumColumn")).ToList();
+
+        result.ShouldBeEquivalentTo(testData);
+    }
+
     private static IEnumerable<T> Track<T>(IEnumerable<T> source, Action onDispose)
     {
         try
