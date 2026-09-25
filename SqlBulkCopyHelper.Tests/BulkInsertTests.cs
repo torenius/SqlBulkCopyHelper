@@ -401,6 +401,37 @@ public class BulkInsertTests(MsSqlFixture fixture) : IClassFixture<MsSqlFixture>
         ids.ShouldBe(testData.Select(x => x.IntColumn).ToList(), ignoreOrder: true);
     }
 
+    [Fact]
+    public async Task BulkInsert_SqlConnectionExtension_ListOfStrings()
+    {
+        List<string?> values = ["A", null, "C"];
+
+        await using var connection = new SqlConnection(_connectionString);
+        await connection.OpenAsync(TestContext.Current.CancellationToken);
+
+        var rows = await connection.BulkInsertAsync("#Test", "Value", values, createTableIfNotExists: true,
+            cancellationToken: TestContext.Current.CancellationToken);
+
+        rows.ShouldBe(3);
+        var result = (await connection.QueryAsync<string?>("SELECT Value FROM #Test")).ToList();
+        result.ShouldBe(values, ignoreOrder: true);
+    }
+
+    [Fact]
+    public async Task BulkInsert_SqlConnectionExtension_ListOfNullableInts()
+    {
+        List<int?> values = [1, null, 3];
+
+        await using var connection = new SqlConnection(_connectionString);
+        await connection.OpenAsync(TestContext.Current.CancellationToken);
+
+        await connection.BulkInsertAsync("#Test", "Value", values, createTableIfNotExists: true,
+            cancellationToken: TestContext.Current.CancellationToken);
+
+        var result = (await connection.QueryAsync<int?>("SELECT Value FROM #Test")).ToList();
+        result.ShouldBe(values, ignoreOrder: true);
+    }
+
     private static IEnumerable<T> Track<T>(IEnumerable<T> source, Action onDispose)
     {
         try

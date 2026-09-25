@@ -181,6 +181,23 @@ public class DataTableTests
         dt.Rows.Count.ShouldBe(nrOrRows);
     }
 
+    [Fact]
+    public void Map_SingleValue_ReferenceAndNullableTypes()
+    {
+        new SqlBulkCopyHelper<string?>("Test").Map("Value")
+            .GetColumnInfo(columnsAreAlwaysNullable: false).ShouldHaveSingleItem().SchemaDefinition.ShouldBe("Value nvarchar(max) null");
+
+        new SqlBulkCopyHelper<int?>("Test").Map("Value")
+            .GetColumnInfo(columnsAreAlwaysNullable: false).ShouldHaveSingleItem().SchemaDefinition.ShouldBe("Value int null");
+
+        new SqlBulkCopyHelper<byte[]>("Test").Map("Value")
+            .GetColumnInfo(columnsAreAlwaysNullable: false).ShouldHaveSingleItem().SchemaDefinition.ShouldBe("Value varbinary(max) null");
+
+        var dt = new SqlBulkCopyHelper<string?>("Test").Map("Value").GetDataTable(["A", null, "C"]);
+        dt.Rows.Count.ShouldBe(3);
+        dt.Rows[1]["Value"].ShouldBe(DBNull.Value);
+    }
+
     private class NullableTest
     {
         public int Id { get; set; }

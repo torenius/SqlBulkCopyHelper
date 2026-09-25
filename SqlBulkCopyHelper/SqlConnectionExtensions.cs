@@ -47,6 +47,7 @@ public static class SqlConnectionExtensions
 
         /// <summary>
         /// Will try to bulk insert all values using SqlBulkCopy.
+        /// Meant for lists of simple values like int, int?, string, Guid or byte[].
         /// </summary>
         /// <param name="tableName">Table to insert data into</param>
         /// <param name="columnName">Name of the column to insert the values to</param>
@@ -60,11 +61,11 @@ public static class SqlConnectionExtensions
         /// <returns>Number of rows inserted</returns>
         public ValueTask<long> BulkInsertAsync<T>(string tableName, string columnName, IEnumerable<T> values, bool createTableIfNotExists = false,
             int timeout = 30, SqlBulkCopyOptions sqlBulkCopyOptions = SqlBulkCopyOptions.Default, SqlTransaction? sqlTransaction = null,
-            Action<SqlBulkCopy>? configureBulkCopy = null, CancellationToken cancellationToken = default) where T : struct
+            Action<SqlBulkCopy>? configureBulkCopy = null, CancellationToken cancellationToken = default)
         {
             var helper = new SqlBulkCopyHelper<T>(tableName)
                 .UseBracketQuoting()
-                .Map(columnName, x => x);
+                .Map(columnName);
 
             if (configureBulkCopy is not null)
             {

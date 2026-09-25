@@ -153,6 +153,12 @@ var helper = new SqlBulkCopyHelper<int>("dbo.Test")
 await helper.BulkInsertAsync(connection, numbers);
 ```
 
+It works the same for other simple values like `int?`, `string`, `Guid` or `byte[]`, and there is a SqlConnection extension for it.
+```csharp
+var names = new List<string?> { "A", null, "C" };
+await connection.BulkInsertAsync("#Names", "Name", names, createTableIfNotExists: true);
+```
+
 ### Dynamic
 For example if you use Dapper without defining a class you get back DapperRow that you can cast to Dictionary<string, object> and use in the mapper.
 

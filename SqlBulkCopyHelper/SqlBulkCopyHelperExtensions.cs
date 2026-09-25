@@ -120,11 +120,12 @@ public static class SqlBulkCopyHelperExtensions
 
     /// <summary>
     /// Map a single value. Just a shorthand for: .Map("ColumnName", x => x);
+    /// Meant for lists of simple values like int, int?, string, Guid or byte[].
     /// </summary>
     /// <param name="helper">The SqlBulkCopyHelper</param>
     /// <param name="columnName">Database column name</param>
     /// <returns>The SqlBulkCopyHelper so you can continue with the builder pattern</returns>
-    public static SqlBulkCopyHelper<T> Map<T>(this SqlBulkCopyHelper<T> helper, string columnName) where T : struct
+    public static SqlBulkCopyHelper<T> Map<T>(this SqlBulkCopyHelper<T> helper, string columnName)
     {
         helper.Map(columnName, x => x);
         return helper;
