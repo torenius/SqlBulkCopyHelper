@@ -62,6 +62,27 @@ var result = connection.Query<TestData>("SELECT * FROM #Test").ToList(); // Here
 await connection.CloseAsync();
 ```
 
+### Configure SqlBulkCopy
+If you need to change settings on the underlying SqlBulkCopy, for example BatchSize or progress notifications, use `ConfigureBulkCopy`.
+It's called after the helper has applied its own settings, so you can also override them.
+```csharp
+var helper = new SqlBulkCopyHelper<TestData>("dbo.Test")
+            .MapAllPublicProperties()
+            .ConfigureBulkCopy(bulkCopy =>
+            {
+                bulkCopy.BatchSize = 10_000;
+                bulkCopy.NotifyAfter = 50_000;
+                bulkCopy.SqlRowsCopied += (_, e) => Console.WriteLine($"{e.RowsCopied} rows copied");
+            });
+
+await helper.BulkInsertAsync(connection, testData);
+```
+
+It's also possible to use it in the SqlConnection extension.
+```csharp
+await connection.BulkInsertAsync("dbo.Test", testData, configureBulkCopy: bulkCopy => bulkCopy.BatchSize = 10_000);
+```
+
 ### Naming convention
 `MapAllPublicProperties` will default just use PropertyInfo.Name  
 You can change the behavior by providing a function.

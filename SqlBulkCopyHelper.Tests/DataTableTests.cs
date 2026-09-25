@@ -242,4 +242,32 @@ public class DataTableTests
         columns["Description"].ShouldBe("Description nvarchar(max) null");
         columns["Data"].ShouldBe("Data varbinary(max) null");
     }
+
+    private class MappingTest
+    {
+        public ulong ULong { get; set; }
+        public DateOnly DateOnly { get; set; }
+        public TimeOnly TimeOnly { get; set; }
+        public decimal Decimal { get; set; }
+        public decimal? NullableDecimal { get; set; }
+    }
+
+    [Fact]
+    public void SchemaDefinitionMapping_NullableTypesUseUnderlyingType()
+    {
+        var helper = new SqlBulkCopyHelper<MappingTest>("Test")
+            .MapAllPublicProperties();
+
+        helper.SchemaDefinitionMapping[typeof(decimal)] = "numeric(18,2)";
+
+        var columns = helper
+            .GetColumnInfo(columnsAreAlwaysNullable: false)
+            .ToDictionary(x => x.ColumnName, x => x.SchemaDefinition);
+
+        columns["ULong"].ShouldBe("ULong numeric(20,0) not null");
+        columns["DateOnly"].ShouldBe("DateOnly date not null");
+        columns["TimeOnly"].ShouldBe("TimeOnly time(7) not null");
+        columns["Decimal"].ShouldBe("Decimal numeric(18,2) not null");
+        columns["NullableDecimal"].ShouldBe("NullableDecimal numeric(18,2) null");
+    }
 }

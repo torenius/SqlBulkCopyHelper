@@ -6,6 +6,9 @@ using System.Reflection;
 
 namespace SqlBulkCopyHelper;
 
+/// <summary>
+/// Extension methods for mapping to a SqlBulkCopyHelper.
+/// </summary>
 public static class SqlBulkCopyHelperExtensions
 {
     /// <param name="helper">The SqlBulkCopyHelper</param>

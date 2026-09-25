@@ -7,6 +7,9 @@ using Microsoft.Data.SqlClient;
 
 namespace SqlBulkCopyHelper;
 
+/// <summary>
+/// Extension methods for bulk inserting directly on a SqlConnection.
+/// </summary>
 public static class SqlConnectionExtensions
 {
     /// <param name="connection">Connection to execute the insert on</param>
@@ -19,19 +22,26 @@ public static class SqlConnectionExtensions
         /// <param name="tableName">Table to insert data into</param>
         /// <param name="entities">Entities to insert</param>
         /// <param name="columnNameFunc">How to map from PropertyInfo to the desired column name. Default just PropertyInfo.Name</param>
-        /// <param name="createTableIfNotExists">If true it will first make a call to creating the table that "CreateTableScript" generates</param>
+        /// <param name="createTableIfNotExists">If true it will first make a call to creating the table that "CreateTableScript" generates. See SqlBulkCopyHelper.BulkInsertAsync for transaction behavior.</param>
         /// <param name="timeout">Number of seconds for the operation to complete before it times out. 0 equals no timeout. Default 30 seconds</param>
         /// <param name="sqlBulkCopyOptions">Different options that SqlBulkCopy will consider</param>
-        /// <param name="sqlTransaction">If this should be done in a specific transaction or not</param>
+        /// <param name="sqlTransaction">If this should be done in a specific transaction or not. The caller is responsible for commit or rollback.</param>
+        /// <param name="configureBulkCopy">Configure the SqlBulkCopy instance, for example BatchSize, NotifyAfter or SqlRowsCopied. See SqlBulkCopyHelper.ConfigureBulkCopy</param>
         /// <param name="cancellationToken">Do you like to have the option to cancel the operation?</param>
         /// <returns>Number of rows inserted</returns>
         public ValueTask<long> BulkInsertAsync<T>(string tableName, IEnumerable<T> entities, Func<PropertyInfo, string>? columnNameFunc = null, bool createTableIfNotExists = false,
-            int timeout = 30, SqlBulkCopyOptions sqlBulkCopyOptions = SqlBulkCopyOptions.Default, SqlTransaction? sqlTransaction = null, CancellationToken cancellationToken = default) where T : class
+            int timeout = 30, SqlBulkCopyOptions sqlBulkCopyOptions = SqlBulkCopyOptions.Default, SqlTransaction? sqlTransaction = null,
+            Action<SqlBulkCopy>? configureBulkCopy = null, CancellationToken cancellationToken = default) where T : class
         {
             var helper = new SqlBulkCopyHelper<T>(tableName)
                 .UseBracketQuoting()
                 .MapAllPublicProperties(columnNameFunc);
-        
+
+            if (configureBulkCopy is not null)
+            {
+                helper.ConfigureBulkCopy(configureBulkCopy);
+            }
+
             return helper.BulkInsertAsync(connection, entities, createTableIfNotExists, timeout, sqlBulkCopyOptions, sqlTransaction, cancellationToken);
         }
 
@@ -41,19 +51,26 @@ public static class SqlConnectionExtensions
         /// <param name="tableName">Table to insert data into</param>
         /// <param name="columnName">Name of the column to insert the values to</param>
         /// <param name="values">Values to insert</param>
-        /// <param name="createTableIfNotExists">If true it will first make a call to creating the table that "CreateTableScript" generates</param>
+        /// <param name="createTableIfNotExists">If true it will first make a call to creating the table that "CreateTableScript" generates. See SqlBulkCopyHelper.BulkInsertAsync for transaction behavior.</param>
         /// <param name="timeout">Number of seconds for the operation to complete before it times out. 0 equals no timeout. Default 30 seconds</param>
         /// <param name="sqlBulkCopyOptions">Different options that SqlBulkCopy will consider</param>
-        /// <param name="sqlTransaction">If this should be done in a specific transaction or not</param>
+        /// <param name="sqlTransaction">If this should be done in a specific transaction or not. The caller is responsible for commit or rollback.</param>
+        /// <param name="configureBulkCopy">Configure the SqlBulkCopy instance, for example BatchSize, NotifyAfter or SqlRowsCopied. See SqlBulkCopyHelper.ConfigureBulkCopy</param>
         /// <param name="cancellationToken">Do you like to have the option to cancel the operation?</param>
         /// <returns>Number of rows inserted</returns>
         public ValueTask<long> BulkInsertAsync<T>(string tableName, string columnName, IEnumerable<T> values, bool createTableIfNotExists = false,
-            int timeout = 30, SqlBulkCopyOptions sqlBulkCopyOptions = SqlBulkCopyOptions.Default, SqlTransaction? sqlTransaction = null, CancellationToken cancellationToken = default) where T : struct
+            int timeout = 30, SqlBulkCopyOptions sqlBulkCopyOptions = SqlBulkCopyOptions.Default, SqlTransaction? sqlTransaction = null,
+            Action<SqlBulkCopy>? configureBulkCopy = null, CancellationToken cancellationToken = default) where T : struct
         {
             var helper = new SqlBulkCopyHelper<T>(tableName)
                 .UseBracketQuoting()
                 .Map(columnName, x => x);
-        
+
+            if (configureBulkCopy is not null)
+            {
+                helper.ConfigureBulkCopy(configureBulkCopy);
+            }
+
             return helper.BulkInsertAsync(connection, values, createTableIfNotExists, timeout, sqlBulkCopyOptions, sqlTransaction, cancellationToken);
         }
     }

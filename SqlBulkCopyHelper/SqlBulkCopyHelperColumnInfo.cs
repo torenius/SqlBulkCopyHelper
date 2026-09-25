@@ -1,5 +1,13 @@
 ﻿namespace SqlBulkCopyHelper;
 
+/// <summary>
+/// Information about a mapped column.
+/// </summary>
+/// <param name="columnName">Name of the mapped column</param>
+/// <param name="quotedColumnName">Quoted name of the column, or the same as columnName if quoting is not used</param>
+/// <param name="databaseColumnType">The database type of the column</param>
+/// <param name="nullable">True if the column is nullable</param>
+/// <param name="schemaDefinition">A simple create table definition of the column</param>
 public class SqlBulkCopyHelperColumnInfo(string columnName, string quotedColumnName, string databaseColumnType, bool nullable, string schemaDefinition)
 {
     /// <summary>
@@ -29,5 +37,8 @@ public class SqlBulkCopyHelperColumnInfo(string columnName, string quotedColumnN
     /// </summary>
     public string SchemaDefinition { get; private set; } = schemaDefinition;
 
+    /// <summary>
+    /// Returns the SchemaDefinition.
+    /// </summary>
     public override string ToString() => SchemaDefinition;
 }

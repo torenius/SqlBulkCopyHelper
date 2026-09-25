@@ -9,6 +9,7 @@ permissions:
   id-token: write  # enable GitHub OIDC token issuance for this job
   
 env:
+  solution_path: SqlBulkCopyHelper.sln
   project_path: SqlBulkCopyHelper/SqlBulkCopyHelper.csproj
 
 jobs:
@@ -17,18 +18,21 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v6
-        
+
       - name: Setup .Net
         uses: actions/setup-dotnet@v5
         with:
           dotnet-version: 10.0.x
 
       - name: Restore
-        run: dotnet restore ${{ env.project_path }}
-        
+        run: dotnet restore ${{ env.solution_path }}
+
       - name: Build
-        run: dotnet build ${{ env.project_path }} --configuration Release --no-restore
-        
+        run: dotnet build ${{ env.solution_path }} --configuration Release --no-restore
+
+      - name: Test
+        run: dotnet test --solution ${{ env.solution_path }} --configuration Release --no-build
+
       - name: Pack
         run: dotnet pack ${{ env.project_path }} --configuration Release --no-build --output out /p:PackageVersion=${{ github.event.release.tag_name }}
 

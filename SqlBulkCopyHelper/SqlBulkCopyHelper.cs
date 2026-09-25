@@ -10,6 +10,10 @@ using Microsoft.Data.SqlClient;
 
 namespace SqlBulkCopyHelper;
 
+/// <summary>
+/// Maps entities to columns and bulk inserts them with SqlBulkCopy, by streaming them through a DbDataReader.
+/// </summary>
+/// <typeparam name="TEntity">The type of the entities to insert</typeparam>
 public class SqlBulkCopyHelper<TEntity>
 {
     private readonly string _tableName;
@@ -53,10 +57,11 @@ public class SqlBulkCopyHelper<TEntity>
     /// </summary>
     /// <param name="connection">SqlConnection to connect to. If it's closed, this code will open it, do the insert then close it. If it was open it will be kept open.</param>
     /// <param name="entities">All the entities that will be inserted</param>
-    /// <param name="createTableIfNotExists">If true it will first make a call to creating the table that "CreateTableScript" generates. The CREATE TABLE runs in the same transaction as the bulk insert if one is active.</param>
+    /// <param name="createTableIfNotExists">If true it will first make a call to creating the table that "CreateTableScript" generates. The CREATE TABLE runs in the same transaction as the bulk insert.
+    /// If no sqlTransaction is provided, a transaction is started and committed by this method (unless SqlBulkCopyOptions.UseInternalTransaction is used).</param>
     /// <param name="timeout">Number of seconds for the operation to complete before it times out. 0 equals no timeout. Default 30 seconds</param>
     /// <param name="sqlBulkCopyOptions">Different options that SqlBulkCopy will consider</param>
-    /// <param name="sqlTransaction">If this should be done in a specific transaction or not</param>
+    /// <param name="sqlTransaction">If this should be done in a specific transaction or not. The caller is responsible for commit or rollback.</param>
     /// <param name="cancellationToken">Do you like to have the option to cancel the operation?</param>
     /// <returns>Number of rows inserted</returns>
     public async ValueTask<long> BulkInsertAsync(SqlConnection connection, IEnumerable<TEntity> entities, bool createTableIfNotExists = false,
@@ -74,63 +79,78 @@ public class SqlBulkCopyHelper<TEntity>
             closeConnection = true;
         }
 
-        var commitTransaction = false;
-        if (sqlBulkCopyOptions != SqlBulkCopyOptions.Default && sqlTransaction is null)
-        {
-            sqlTransaction = connection.BeginTransaction();
-            commitTransaction = true;
-        }
-
-        long rowsCopied;
         try
         {
-            using var bulkCopy = sqlTransaction is not null
-                ? new SqlBulkCopy(connection, sqlBulkCopyOptions, sqlTransaction)
-                : new SqlBulkCopy(connection);
+            // CREATE TABLE and the bulk insert should succeed or fail together.
+            // If the caller provides a transaction, it's up to the caller to commit or rollback.
+            var useOwnTransaction = createTableIfNotExists
+                && sqlTransaction is null
+                && !sqlBulkCopyOptions.HasFlag(SqlBulkCopyOptions.UseInternalTransaction);
 
-            bulkCopy.DestinationTableName = string.Join(".", _tableName.Split('.').Select(QuoteName));
-            bulkCopy.BulkCopyTimeout = timeout;
+            await using var ownTransaction = useOwnTransaction
+                ? (SqlTransaction)await connection.BeginTransactionAsync(cancellationToken)
+                : null;
 
-            foreach (var columnInfo in GetColumnInfo())
+            var transaction = sqlTransaction ?? ownTransaction;
+
+            try
             {
-                bulkCopy.ColumnMappings.Add(columnInfo.ColumnName, columnInfo.QuotedColumnName);
-            }
+                if (createTableIfNotExists)
+                {
+                    await using var sqlCommand = connection.CreateCommand();
+                    sqlCommand.Transaction = transaction;
+                    sqlCommand.CommandText = CreateTableScript(checkIfTableExists: true);
+                    await sqlCommand.ExecuteNonQueryAsync(cancellationToken);
+                }
 
-            if (createTableIfNotExists)
+                using var bulkCopy = new SqlBulkCopy(connection, sqlBulkCopyOptions, transaction);
+                bulkCopy.DestinationTableName = string.Join(".", _tableName.Split('.').Select(QuoteName));
+                bulkCopy.BulkCopyTimeout = timeout;
+
+                foreach (var columnInfo in GetColumnInfo())
+                {
+                    bulkCopy.ColumnMappings.Add(columnInfo.ColumnName, columnInfo.QuotedColumnName);
+                }
+
+                _configureBulkCopy?.Invoke(bulkCopy);
+
+                await using var reader = GetDataReader(entities);
+                await bulkCopy.WriteToServerAsync(reader, cancellationToken);
+
+                if (ownTransaction is not null)
+                {
+                    await ownTransaction.CommitAsync(cancellationToken);
+                }
+
+                return bulkCopy.RowsCopied64;
+            }
+            catch when (ownTransaction is not null)
             {
-                using var sqlCommand = connection.CreateCommand();
-                sqlCommand.Transaction = sqlTransaction;
-                sqlCommand.CommandText = CreateTableScript(checkIfTableExists: true);
-                await sqlCommand.ExecuteNonQueryAsync(cancellationToken);
-            }
+                try
+                {
+                    await ownTransaction.RollbackAsync(CancellationToken.None);
+                }
+                catch
+                {
+                    // A failed rollback should not hide the original exception
+                }
 
-            await bulkCopy.WriteToServerAsync(GetDataReader(entities), cancellationToken);
-            rowsCopied = bulkCopy.RowsCopied64;
-
-            if (commitTransaction)
-            {
-                sqlTransaction!.Commit();
+                throw;
             }
-        }
-        catch when (commitTransaction)
-        {
-            sqlTransaction!.Rollback();
-            throw;
         }
         finally
         {
             if (closeConnection)
             {
-                connection.Close();
+                await connection.CloseAsync();
             }
         }
-
-        return rowsCopied;
     }
 
     /// <summary>
     /// Can be used to add or change how Types are mapped for the value in SqlBulkCopyHelperColumnInfo.SchemaDefinition.
     /// Intention is just to use these mappings for a staging table. They might be on the "bigger" side.
+    /// Nullable types (e.g. int?) use the mapping of their underlying type (int), and enums the mapping of their underlying type.
     /// </summary>
     public Dictionary<Type, string> SchemaDefinitionMapping { get; set; } = new()
     {
@@ -142,36 +162,20 @@ public class SqlBulkCopyHelper<TEntity>
         { typeof(int), "int" },
         { typeof(uint), "bigint" },
         { typeof(long), "bigint" },
-        { typeof(ulong), "bigint" },
+        { typeof(ulong), "numeric(20,0)" },
         { typeof(float), "real" },
         { typeof(double), "float" },
         { typeof(decimal), "numeric(38,15)" },
         { typeof(DateTime), "datetime2(7)" },
         { typeof(DateTimeOffset), "datetimeoffset(7)" },
+        { typeof(DateOnly), "date" },
+        { typeof(TimeOnly), "time(7)" },
         { typeof(TimeSpan), "time(7)" },
         { typeof(Guid), "uniqueidentifier" },
         { typeof(string), "nvarchar(max)" },
         { typeof(char), "nchar(1)" },
         { typeof(char[]), "nvarchar(max)" },
         { typeof(byte[]), "varbinary(max)" },
-
-        { typeof(bool?), "bit" },
-        { typeof(byte?), "tinyint" },
-        { typeof(sbyte?), "smallint" },
-        { typeof(short?), "smallint" },
-        { typeof(ushort?), "int" },
-        { typeof(int?), "int" },
-        { typeof(uint?), "bigint" },
-        { typeof(long?), "bigint" },
-        { typeof(ulong?), "bigint" },
-        { typeof(float?), "real" },
-        { typeof(double?), "float" },
-        { typeof(decimal?), "numeric(38,15)" },
-        { typeof(DateTime?), "datetime2(7)" },
-        { typeof(DateTimeOffset?), "datetimeoffset(7)" },
-        { typeof(TimeSpan?), "time(7)" },
-        { typeof(Guid?), "uniqueidentifier" },
-        { typeof(char?), "nchar(1)" },
     };
 
     /// <summary>
@@ -310,7 +314,7 @@ public class SqlBulkCopyHelper<TEntity>
         return this;
     }
 
-    /// <param name="nullable">If null, reference types and Nullable&lt;T&gt; are considered nullable</param>
+    // nullable: If null, reference types and Nullable<T> are considered nullable
     private SqlBulkCopyHelper<TEntity> AddOrUpdateColumn(string columnName, Type type, Func<TEntity, object> propertyGetter, bool? nullable = null)
     {
         RemoveMap(columnName);
@@ -337,6 +341,21 @@ public class SqlBulkCopyHelper<TEntity>
         return this;
     }
 
+    /// <summary>
+    /// Configure the SqlBulkCopy instance used by BulkInsertAsync, for example BatchSize, NotifyAfter or SqlRowsCopied.
+    /// It's called after this helper has applied its own settings, so it's possible to override them (for example BulkCopyTimeout).
+    /// Calling this method again replaces the previous configuration.
+    /// </summary>
+    /// <param name="configure">Action that will be called with the SqlBulkCopy instance before the insert starts</param>
+    /// <returns>The SqlBulkCopyHelper so you can continue with the builder pattern</returns>
+    public SqlBulkCopyHelper<TEntity> ConfigureBulkCopy(Action<SqlBulkCopy> configure)
+    {
+        ArgumentNullException.ThrowIfNull(configure);
+        _configureBulkCopy = configure;
+        return this;
+    }
+
+    private Action<SqlBulkCopy>? _configureBulkCopy;
     private bool _useQuoting;
     private static readonly SqlCommandBuilder _quoter = new() { QuotePrefix = "[", QuoteSuffix = "]" };
 
