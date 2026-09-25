@@ -21,9 +21,17 @@ public static class SqlBulkCopyHelperExtensions
         /// </summary>
         /// <param name="columnNameFunc">How to map from PropertyInfo to the desired column name. Default just PropertyInfo.Name</param>
         /// <returns>The SqlBulkCopyHelper so you can continue with the builder pattern</returns>
-        /// <exception cref="InvalidOperationException">If the class have no public properties</exception>
+        /// <exception cref="InvalidOperationException">If the class have no public properties, or if it's a simple value like string or byte[]</exception>
         public SqlBulkCopyHelper<T> MapAllPublicProperties(Func<PropertyInfo, string>? columnNameFunc = null)
         {
+            // Without this check a string would be mapped as its Length property
+            if (helper.SchemaDefinitionMapping.ContainsKey(typeof(T)))
+            {
+                throw new InvalidOperationException(
+                    $"{typeof(T).Name} is a simple value and can't be mapped by its properties. " +
+                    "Use .Map(\"ColumnName\") or connection.BulkInsertAsync(tableName, columnName, values) instead.");
+            }
+
             var properties = typeof(T)
                 .GetProperties(BindingFlags.Public | BindingFlags.Instance)
                 .Where(IsMappable)

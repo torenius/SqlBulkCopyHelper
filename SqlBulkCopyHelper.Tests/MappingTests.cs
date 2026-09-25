@@ -29,6 +29,28 @@ public class MappingTests
         columns.ShouldBe(["Id", "Name"]);
     }
 
+    [Fact]
+    public void MapAllPublicProperties_SimpleValues_Throws()
+    {
+        Should.Throw<InvalidOperationException>(() => new SqlBulkCopyHelper<string>("Test").MapAllPublicProperties())
+            .Message.ShouldContain(".Map(\"ColumnName\")");
+        Should.Throw<InvalidOperationException>(() => new SqlBulkCopyHelper<byte[]>("Test").MapAllPublicProperties());
+        Should.Throw<InvalidOperationException>(() => new SqlBulkCopyHelper<char[]>("Test").MapAllPublicProperties());
+    }
+
+    [Fact]
+    public void SqlConnectionExtension_ListOfStringsWithoutColumnName_Throws()
+    {
+        using var connection = new Microsoft.Data.SqlClient.SqlConnection();
+        List<string> values = ["A", "B"];
+
+        // Used to insert string.Length into a "Length" column
+        Should.Throw<InvalidOperationException>(() =>
+        {
+            _ = connection.BulkInsertAsync("#Test", values);
+        });
+    }
+
     [Theory]
     [InlineData("PrivateGetter")]
     [InlineData("WriteOnly")]
