@@ -18,8 +18,10 @@ internal class AsyncDisguisedDataReader<TEntity> : DisguisedDataReaderBase<TEnti
     /// <param name="columnDefinitions">The mapped columns</param>
     /// <param name="entities">The source</param>
     /// <param name="cancellationToken">Passed to the source when it's enumerated. IAsyncEnumerable gets the token once, not per MoveNextAsync.</param>
-    public AsyncDisguisedDataReader(List<DisguisedColumnDefinition<TEntity>> columnDefinitions, IAsyncEnumerable<TEntity> entities, CancellationToken cancellationToken)
-        : base(columnDefinitions)
+    /// <param name="onRowRead">Called with the entity each time the reader moves to a new row</param>
+    public AsyncDisguisedDataReader(List<DisguisedColumnDefinition<TEntity>> columnDefinitions, IAsyncEnumerable<TEntity> entities, CancellationToken cancellationToken,
+        Action<TEntity>? onRowRead = null)
+        : base(columnDefinitions, onRowRead)
     {
         _enumerator = entities.GetAsyncEnumerator(cancellationToken);
     }

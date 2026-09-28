@@ -21,8 +21,14 @@ internal abstract class DisguisedDataReaderBase<TEntity> : DbDataReader
     private long _currentRow; // 0 = no row has been read yet
     private bool _hasCurrentRow;
 
-    protected DisguisedDataReaderBase(List<DisguisedColumnDefinition<TEntity>> columnDefinitions)
+    private readonly Action<TEntity>? _onRowRead;
+
+    /// <param name="columnDefinitions">The mapped columns</param>
+    /// <param name="onRowRead">Called with the entity each time the reader moves to a new row</param>
+    protected DisguisedDataReaderBase(List<DisguisedColumnDefinition<TEntity>> columnDefinitions, Action<TEntity>? onRowRead)
     {
+        _onRowRead = onRowRead;
+
         // A copy, so changes to the helper's mapping don't affect a reader that has already been created
         _columnDefinitions = [.. columnDefinitions];
         _values = new object[_columnDefinitions.Count];
@@ -49,6 +55,7 @@ internal abstract class DisguisedDataReaderBase<TEntity> : DbDataReader
         {
             // Invalidates all cached values, they will be fetched when they are read
             _currentRow++;
+            _onRowRead?.Invoke(Current);
         }
         else
         {

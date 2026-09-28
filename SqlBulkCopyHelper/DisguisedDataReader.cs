@@ -13,8 +13,8 @@ internal class DisguisedDataReader<TEntity> : DisguisedDataReaderBase<TEntity>
     private bool? _hasRows;
     private bool _peekedFirstRow;
 
-    public DisguisedDataReader(List<DisguisedColumnDefinition<TEntity>> columnDefinitions, IEnumerable<TEntity> entities)
-        : base(columnDefinitions)
+    public DisguisedDataReader(List<DisguisedColumnDefinition<TEntity>> columnDefinitions, IEnumerable<TEntity> entities, Action<TEntity>? onRowRead = null)
+        : base(columnDefinitions, onRowRead)
     {
         _enumerator = entities.GetEnumerator();
     }

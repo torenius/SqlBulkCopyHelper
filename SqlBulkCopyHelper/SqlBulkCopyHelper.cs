@@ -3,6 +3,8 @@ using System.Collections.Generic;
 using System.Data;
 using System.Data.Common;
 using System.Linq;
+using System.Linq.Expressions;
+using System.Reflection;
 using System.Runtime.CompilerServices;
 using System.Text;
 using System.Threading;
@@ -41,6 +43,7 @@ public class SqlBulkCopyHelper<TEntity>
     /// </summary>
     /// <param name="entities">Entities to convert</param>
     /// <returns>DbDataReader that contains the mapped columns</returns>
+    [OverloadResolutionPriority(1)]
     public DbDataReader GetDataReader(IEnumerable<TEntity> entities) =>
         new DisguisedDataReader<TEntity>(_columnDefinitions, entities);
 
@@ -85,7 +88,8 @@ public class SqlBulkCopyHelper<TEntity>
     public ValueTask<long> BulkInsertAsync(SqlConnection connection, IEnumerable<TEntity> entities, bool createTableIfNotExists = false,
         int timeout = 30, SqlBulkCopyOptions sqlBulkCopyOptions = SqlBulkCopyOptions.Default, SqlTransaction? sqlTransaction = null, CancellationToken cancellationToken = default)
     {
-        return BulkInsertCoreAsync(connection, () => GetDataReader(entities), createTableIfNotExists, timeout, sqlBulkCopyOptions, sqlTransaction, cancellationToken);
+        return BulkInsertCoreAsync(connection, (columnDefinitions, onRowRead) => new DisguisedDataReader<TEntity>(columnDefinitions, entities, onRowRead),
+            createTableIfNotExists, timeout, sqlBulkCopyOptions, sqlTransaction, cancellationToken);
     }
 
     /// <summary>
@@ -105,13 +109,19 @@ public class SqlBulkCopyHelper<TEntity>
     public ValueTask<long> BulkInsertAsync(SqlConnection connection, IAsyncEnumerable<TEntity> entities, bool createTableIfNotExists = false,
         int timeout = 30, SqlBulkCopyOptions sqlBulkCopyOptions = SqlBulkCopyOptions.Default, SqlTransaction? sqlTransaction = null, CancellationToken cancellationToken = default)
     {
-        return BulkInsertCoreAsync(connection, () => GetDataReader(entities, cancellationToken), createTableIfNotExists, timeout, sqlBulkCopyOptions, sqlTransaction, cancellationToken);
+        return BulkInsertCoreAsync(connection, (columnDefinitions, onRowRead) => new AsyncDisguisedDataReader<TEntity>(columnDefinitions, entities, cancellationToken, onRowRead),
+            createTableIfNotExists, timeout, sqlBulkCopyOptions, sqlTransaction, cancellationToken);
     }
 
-    private async ValueTask<long> BulkInsertCoreAsync(SqlConnection connection, Func<DbDataReader> createReader, bool createTableIfNotExists,
-        int timeout, SqlBulkCopyOptions sqlBulkCopyOptions, SqlTransaction? sqlTransaction, CancellationToken cancellationToken)
+    private async ValueTask<long> BulkInsertCoreAsync(SqlConnection connection, Func<List<DisguisedColumnDefinition<TEntity>>, Action<TEntity>?, DbDataReader> createReader,
+        bool createTableIfNotExists, int timeout, SqlBulkCopyOptions sqlBulkCopyOptions, SqlTransaction? sqlTransaction, CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
+
+        if (_outputColumns.Count > 0 && sqlBulkCopyOptions.HasFlag(SqlBulkCopyOptions.KeepIdentity))
+        {
+            throw new NotSupportedException("SqlBulkCopyOptions.KeepIdentity can't be combined with OutputColumn.");
+        }
 
         var closeConnection = false;
         if (connection.State != ConnectionState.Open)
@@ -149,30 +159,17 @@ public class SqlBulkCopyHelper<TEntity>
                     }
                 }
 
-                using var bulkCopy = new SqlBulkCopy(connection, sqlBulkCopyOptions, transaction);
-                bulkCopy.DestinationTableName = GetTableName();
-                bulkCopy.BulkCopyTimeout = timeout;
-
-                // Not using GetColumnInfo, since the insert doesn't need a SchemaDefinitionMapping for the types
-                foreach (var columnDefinition in _columnDefinitions)
-                {
-                    bulkCopy.ColumnMappings.Add(columnDefinition.ColumnName, QuoteName(columnDefinition.ColumnName));
-                }
-
-                _configureBulkCopy?.Invoke(bulkCopy);
-
-                var reader = createReader();
-                await using (reader.ConfigureAwait(false))
-                {
-                    await bulkCopy.WriteToServerAsync(reader, cancellationToken).ConfigureAwait(false);
-                }
+                var rows = _outputColumns.Count == 0
+                    ? await WriteToServerAsync(connection, transaction, GetTableName(), createReader(_columnDefinitions, null),
+                        extraColumnMappings: [], timeout, sqlBulkCopyOptions, cancellationToken).ConfigureAwait(false)
+                    : await InsertWithOutputAsync(connection, transaction, createReader, timeout, sqlBulkCopyOptions, cancellationToken).ConfigureAwait(false);
 
                 if (ownTransaction is not null)
                 {
                     await ownTransaction.CommitAsync(cancellationToken).ConfigureAwait(false);
                 }
 
-                return bulkCopy.RowsCopied64;
+                return rows;
             }
             catch when (ownTransaction is not null)
             {
@@ -199,6 +196,163 @@ public class SqlBulkCopyHelper<TEntity>
             {
                 await connection.CloseAsync().ConfigureAwait(false);
             }
+        }
+    }
+
+    private async ValueTask<long> WriteToServerAsync(SqlConnection connection, SqlTransaction? transaction, string destinationTableName, DbDataReader reader,
+        List<(string Source, string Destination)> extraColumnMappings, int timeout, SqlBulkCopyOptions sqlBulkCopyOptions, CancellationToken cancellationToken)
+    {
+        await using (reader.ConfigureAwait(false))
+        {
+            using var bulkCopy = new SqlBulkCopy(connection, sqlBulkCopyOptions, transaction);
+            bulkCopy.DestinationTableName = destinationTableName;
+            bulkCopy.BulkCopyTimeout = timeout;
+
+            foreach (var columnDefinition in _columnDefinitions)
+            {
+                bulkCopy.ColumnMappings.Add(columnDefinition.ColumnName, QuoteName(columnDefinition.ColumnName));
+            }
+
+            foreach (var (source, destination) in extraColumnMappings)
+            {
+                bulkCopy.ColumnMappings.Add(source, destination);
+            }
+
+            _configureBulkCopy?.Invoke(bulkCopy);
+
+            await bulkCopy.WriteToServerAsync(reader, cancellationToken).ConfigureAwait(false);
+            return bulkCopy.RowsCopied64;
+        }
+    }
+
+    private const string RowNumberColumnName = "SqlBulkCopyHelper_RowNumber";
+
+    /// <summary>
+    /// SqlBulkCopy can't return values generated by the database, so the entities are bulk copied to a staging table together with their row number.
+    /// A MERGE that never matches then inserts them into the target table, since MERGE (unlike INSERT) can OUTPUT columns from the source.
+    /// That gives the row number together with the generated values, which is used to set them on the right entity.
+    /// </summary>
+    private async ValueTask<long> InsertWithOutputAsync(SqlConnection connection, SqlTransaction? transaction,
+        Func<List<DisguisedColumnDefinition<TEntity>>, Action<TEntity>?, DbDataReader> createReader,
+        int timeout, SqlBulkCopyOptions sqlBulkCopyOptions, CancellationToken cancellationToken)
+    {
+        var outputColumns = _outputColumns.ToList();
+        var suffix = Guid.NewGuid().ToString("N");
+        var stagingTable = Quote("#SqlBulkCopyHelper_Staging_" + suffix);
+        var outputTable = Quote("#SqlBulkCopyHelper_Output_" + suffix);
+        var targetTable = GetTableName();
+        var rowNumberColumn = Quote(RowNumberColumnName);
+        var columns = _columnDefinitions.Select(x => QuoteName(x.ColumnName)).ToList();
+        var outputColumnNames = outputColumns.Select(x => QuoteName(x.ColumnName)).ToList();
+
+        try
+        {
+            await ExecuteNonQueryAsync(connection, transaction,
+                CreateEmptyCopyScript(stagingTable, targetTable, rowNumberColumn, columns) +
+                CreateEmptyCopyScript(outputTable, targetTable, rowNumberColumn, outputColumnNames),
+                timeout, cancellationToken).ConfigureAwait(false);
+
+            // The row number is the index in this list, so the entity can be found when the output is read
+            var entities = new List<TEntity>();
+            var rowNumberColumnDefinition = new DisguisedColumnDefinition<TEntity>
+            {
+                ColumnName = RowNumberColumnName,
+                Type = typeof(long),
+                Nullable = false,
+                PropertyGetter = _ => (long)(entities.Count - 1)
+            };
+
+            await WriteToServerAsync(connection, transaction, stagingTable, createReader([.. _columnDefinitions, rowNumberColumnDefinition], entities.Add),
+                extraColumnMappings: [(RowNumberColumnName, rowNumberColumn)], timeout, sqlBulkCopyOptions, cancellationToken).ConfigureAwait(false);
+
+            var command = connection.CreateCommand();
+            await using (command.ConfigureAwait(false))
+            {
+                command.Transaction = transaction;
+                command.CommandTimeout = timeout;
+                command.CommandText = CreateMergeWithOutputScript(targetTable, stagingTable, outputTable, rowNumberColumn, columns, outputColumnNames);
+
+                var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+                await using (reader.ConfigureAwait(false))
+                {
+                    long rows = 0;
+                    while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+                    {
+                        var entity = entities[checked((int)reader.GetInt64(0))];
+                        for (var i = 0; i < outputColumns.Count; i++)
+                        {
+                            outputColumns[i].SetValue(entity, reader, i + 1);
+                        }
+
+                        rows++;
+                    }
+
+                    return rows;
+                }
+            }
+        }
+        finally
+        {
+            try
+            {
+                // The tables are gone if the connection is closed or the transaction is rolled back, but not if the caller keeps using the connection
+                await ExecuteNonQueryAsync(connection, transaction,
+                    $"DROP TABLE IF EXISTS {stagingTable};{Environment.NewLine}DROP TABLE IF EXISTS {outputTable};",
+                    timeout, CancellationToken.None).ConfigureAwait(false);
+            }
+            catch
+            {
+                // A failed clean-up should not hide the original exception, for example if the transaction is doomed
+            }
+        }
+    }
+
+    /// <summary>
+    /// Creates an empty table with the same column types as the target table. The UNION ALL makes sure an IDENTITY is not copied.
+    /// </summary>
+    private static string CreateEmptyCopyScript(string tableName, string targetTable, string rowNumberColumn, List<string> columns)
+    {
+        var columnList = string.Concat(columns.Select(x => ", " + x));
+        return $"SELECT TOP (0) CAST(0 AS bigint) AS {rowNumberColumn}{columnList} INTO {tableName} FROM {targetTable}{Environment.NewLine}" +
+               $"UNION ALL SELECT TOP (0) CAST(0 AS bigint){columnList} FROM {targetTable};{Environment.NewLine}";
+    }
+
+    private static string CreateMergeWithOutputScript(string targetTable, string stagingTable, string outputTable, string rowNumberColumn,
+        List<string> columns, List<string> outputColumns)
+    {
+        var sb = new StringBuilder();
+        sb.Append("MERGE INTO ").Append(targetTable).AppendLine(" AS T");
+        sb.Append("USING ").Append(stagingTable).AppendLine(" AS S ON 1 = 0");
+        sb.Append("WHEN NOT MATCHED THEN INSERT ");
+
+        if (columns.Count == 0)
+        {
+            sb.AppendLine("DEFAULT VALUES");
+        }
+        else
+        {
+            sb.Append('(').AppendJoin(", ", columns).Append(") VALUES (").AppendJoin(", ", columns.Select(x => "S." + x)).AppendLine(")");
+        }
+
+        // OUTPUT INTO, since OUTPUT directly to the client is not allowed if the target table has triggers
+        sb.Append("OUTPUT S.").Append(rowNumberColumn).Append(string.Concat(outputColumns.Select(x => ", inserted." + x)))
+            .Append(" INTO ").Append(outputTable).Append(" (").Append(rowNumberColumn).Append(string.Concat(outputColumns.Select(x => ", " + x))).AppendLine(");");
+
+        sb.Append("SELECT ").Append(rowNumberColumn).Append(string.Concat(outputColumns.Select(x => ", " + x)))
+            .Append(" FROM ").Append(outputTable).Append(" ORDER BY ").Append(rowNumberColumn).AppendLine(";");
+
+        return sb.ToString();
+    }
+
+    private static async Task ExecuteNonQueryAsync(SqlConnection connection, SqlTransaction? transaction, string sql, int timeout, CancellationToken cancellationToken)
+    {
+        var command = connection.CreateCommand();
+        await using (command.ConfigureAwait(false))
+        {
+            command.Transaction = transaction;
+            command.CommandTimeout = timeout;
+            command.CommandText = sql;
+            await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
         }
     }
 
@@ -414,6 +568,62 @@ public class SqlBulkCopyHelper<TEntity>
         return this;
     }
 
+    /// <summary>
+    /// Reads back a value that the database generated for each inserted row, like an IDENTITY, a DEFAULT or a computed column, and passes it to the setter together with its entity.
+    /// Column names are case-insensitive, calling it again for the same column replaces the previous setter.
+    /// <para>
+    /// When at least one output column is used, BulkInsertAsync bulk copies to a staging temp table and inserts into the table with a MERGE.
+    /// The entities are kept in memory until the insert is done, so the values can be set on them.
+    /// The insert behaves like an ordinary INSERT: triggers fire, constraints are checked and NULL is inserted as NULL, instead of the column's DEFAULT.
+    /// SqlBulkCopyOptions.KeepIdentity is not supported.
+    /// </para>
+    /// </summary>
+    /// <param name="columnName">Column in the table to read the value from. It doesn't have to be mapped.</param>
+    /// <param name="setter">Called with the entity and the value that was generated for it</param>
+    /// <typeparam name="TValue">The type to read the value as</typeparam>
+    /// <returns>The SqlBulkCopyHelper so you can continue with the builder pattern</returns>
+    public SqlBulkCopyHelper<TEntity> OutputColumn<TValue>(string columnName, Action<TEntity, TValue> setter)
+    {
+        if (string.IsNullOrWhiteSpace(columnName)) throw new ArgumentNullException(nameof(columnName));
+        ArgumentNullException.ThrowIfNull(setter);
+
+        _outputColumns.RemoveAll(x => string.Equals(x.ColumnName, columnName, StringComparison.OrdinalIgnoreCase));
+        _outputColumns.Add(OutputColumnDefinition<TEntity>.Create(columnName, setter));
+        return this;
+    }
+
+    /// <summary>
+    /// Reads back a value that the database generated for each inserted row and sets it on the property, for example .OutputColumn(x => x.Id).
+    /// See the other OutputColumn overload for how the insert is done.
+    /// </summary>
+    /// <param name="property">The property or field to set, like x => x.Id</param>
+    /// <param name="columnName">Column in the table to read the value from. Default the name of the property.</param>
+    /// <typeparam name="TValue">The type of the property</typeparam>
+    /// <returns>The SqlBulkCopyHelper so you can continue with the builder pattern</returns>
+    /// <exception cref="ArgumentException">If the expression is not a writable property or field directly on the entity</exception>
+    /// <exception cref="InvalidOperationException">If the entity is a value type, since the value would be set on a copy</exception>
+    public SqlBulkCopyHelper<TEntity> OutputColumn<TValue>(Expression<Func<TEntity, TValue>> property, string? columnName = null)
+    {
+        ArgumentNullException.ThrowIfNull(property);
+
+        if (typeof(TEntity).IsValueType)
+        {
+            throw new InvalidOperationException($"{typeof(TEntity).Name} is a value type, so a property would be set on a copy. Use OutputColumn(columnName, setter) instead.");
+        }
+
+        if (property.Body is not MemberExpression { Member: PropertyInfo { CanWrite: true } or FieldInfo { IsInitOnly: false } } member
+            || member.Expression != property.Parameters[0])
+        {
+            throw new ArgumentException("The expression must be a writable property or field directly on the entity, like x => x.Id", nameof(property));
+        }
+
+        var value = Expression.Parameter(typeof(TValue), "value");
+        var setter = Expression.Lambda<Action<TEntity, TValue>>(Expression.Assign(member, value), property.Parameters[0], value).Compile();
+
+        return OutputColumn(string.IsNullOrWhiteSpace(columnName) ? member.Member.Name : columnName, setter);
+    }
+
+    private readonly List<OutputColumnDefinition<TEntity>> _outputColumns = [];
     private Action<SqlBulkCopy>? _configureBulkCopy;
     private bool _useQuoting;
 
