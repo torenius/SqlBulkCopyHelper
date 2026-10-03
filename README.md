@@ -120,6 +120,35 @@ Since the rows are inserted with a MERGE, it behaves like an ordinary INSERT and
 - NULL is inserted as NULL and not replaced with the column's DEFAULT, like with `SqlBulkCopyOptions.KeepNulls`.
 - `SqlBulkCopyOptions.KeepIdentity` is not supported.
 
+### Upsert: insert new rows and update existing ones
+`BulkUpsertAsync` matches the rows on the columns in `MatchOn`. A row that matches a row in the table updates it, otherwise it's inserted.
+```csharp
+var result = await new SqlBulkCopyHelper<Product>("dbo.Products")
+            .MapAllPublicProperties()
+            .RemoveMap("Id")
+            .OutputColumn(x => x.Id) // Set for inserted, updated and unchanged rows
+            .BulkUpsertAsync(connection, products, upsert => upsert
+                .MatchOn("TenantId", "Sku") // Required
+                .IgnoreOnUpdate("CreatedAt") // Inserted, but never updated
+                .OnlyUpdateWhenChanged() // Skip rows where nothing has changed
+                .OnDuplicateKey(DuplicateKeyHandling.KeepLast)); // Default is Throw
+
+Console.WriteLine($"{result.Inserted} inserted, {result.Updated} updated, {result.Unchanged} unchanged");
+```
+
+- **MatchOn**: the key columns. They must be mapped. NULL never matches, so a row with NULL in a key column is always inserted.
+- **IgnoreOnUpdate**: columns that are set when a row is inserted, but are never overwritten when it's updated.
+- **OnlyUpdateWhenChanged**: only updates rows where at least one column has a different value, NULL is considered equal to NULL. The other rows are counted as `Unchanged`, and triggers don't fire for them.
+- **OnDuplicateKey**: if the source has more than one row with the same key, `Throw` (default) throws an exception that tells which keys and rows, before anything is changed. `KeepFirst` and `KeepLast` keep one of them and count the rest as `DuplicatesRemoved`. The removed rows don't get any output values.
+
+How it works: the rows are bulk copied to a staging temp table. In one transaction, the matching rows are updated with an `UPDATE`, and the rest are inserted with the same `MERGE ... ON 1 = 0` as `OutputColumn` uses.
+- If you don't provide a transaction, one is started and committed by `BulkUpsertAsync`. If you provide one, you are responsible for commit or rollback.
+- The table is read with `UPDLOCK, HOLDLOCK`, so two concurrent upserts can't insert the same key. Concurrent upserts of the same keys can deadlock, so retry on deadlocks if you run them in parallel.
+- Add an index on the `MatchOn` columns, otherwise every upsert scans the table.
+- Rows are inserted and updated like with `OutputColumn`: triggers fire, constraints are checked and NULL is inserted as NULL.
+- Without `OutputColumn` the entities are not kept in memory, so it works well with a large `IAsyncEnumerable`.
+- `SqlBulkCopyOptions.KeepIdentity` and `UseInternalTransaction` are not supported.
+
 ### Naming convention
 `MapAllPublicProperties` will by default just use PropertyInfo.Name  
 You can change the behavior by providing a function.

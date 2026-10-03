@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Data;
 using System.Data.Common;
+using System.Globalization;
 using System.Linq;
 using System.Linq.Expressions;
 using System.Reflection;
@@ -123,6 +124,137 @@ public class SqlBulkCopyHelper<TEntity>
             throw new NotSupportedException("SqlBulkCopyOptions.KeepIdentity can't be combined with OutputColumn.");
         }
 
+        // CREATE TABLE and the bulk insert should succeed or fail together.
+        // If the caller provides a transaction, it's up to the caller to commit or rollback.
+        var useOwnTransaction = createTableIfNotExists
+            && sqlTransaction is null
+            && !sqlBulkCopyOptions.HasFlag(SqlBulkCopyOptions.UseInternalTransaction);
+
+        return await ExecuteAsync(connection, sqlTransaction, useOwnTransaction, async transaction =>
+        {
+            if (createTableIfNotExists)
+            {
+                await ExecuteNonQueryAsync(connection, transaction, CreateTableScript(checkIfTableExists: true), timeout, cancellationToken).ConfigureAwait(false);
+            }
+
+            return _outputColumns.Count == 0
+                ? await WriteToServerAsync(connection, transaction, GetTableName(), createReader(_columnDefinitions, null),
+                    extraColumnMappings: [], timeout, sqlBulkCopyOptions, cancellationToken).ConfigureAwait(false)
+                : await InsertWithOutputAsync(connection, transaction, createReader, timeout, sqlBulkCopyOptions, cancellationToken).ConfigureAwait(false);
+        }, cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Inserts the entities that don't match a row in the table and updates the ones that do, matched on the columns in MatchOn.
+    /// <para>
+    /// The entities are bulk copied to a staging temp table. Then the matching rows are updated with an UPDATE, and the rest are inserted with a MERGE that never matches,
+    /// in the same transaction. If no sqlTransaction is provided, a transaction is started and committed by this method.
+    /// The table is locked with UPDLOCK, HOLDLOCK, so concurrent upserts can't insert the same key twice. An index on the MatchOn columns is recommended.
+    /// </para>
+    /// <para>
+    /// OutputColumn values are set on the inserted, updated and unchanged entities. Without OutputColumn the entities are not kept in memory.
+    /// Like with OutputColumn the rows are inserted and updated like an ordinary INSERT and UPDATE: triggers fire, constraints are checked and NULL is inserted as NULL.
+    /// SqlBulkCopyOptions.KeepIdentity and UseInternalTransaction are not supported.
+    /// </para>
+    /// </summary>
+    /// <param name="connection">SqlConnection to connect to. If it's closed, this code will open it, do the upsert then close it. If it was open it will be kept open.</param>
+    /// <param name="entities">All the entities that will be inserted or updated</param>
+    /// <param name="configure">Configures the upsert. MatchOn is required.</param>
+    /// <param name="timeout">Number of seconds for each step to complete before it times out. 0 equals no timeout. Default 30 seconds</param>
+    /// <param name="sqlBulkCopyOptions">Options for the SqlBulkCopy to the staging table</param>
+    /// <param name="sqlTransaction">If this should be done in a specific transaction or not. The caller is responsible for commit or rollback.</param>
+    /// <param name="cancellationToken">Do you like to have the option to cancel the operation?</param>
+    /// <returns>Number of rows inserted, updated and unchanged</returns>
+    /// <exception cref="InvalidOperationException">If MatchOn is missing, a column in the options is not mapped, or the source has duplicate keys and DuplicateKeyHandling is Throw</exception>
+    // Preferred over the IAsyncEnumerable overload for types that implement both, like an EF Core DbSet
+    [OverloadResolutionPriority(1)]
+    public ValueTask<SqlBulkUpsertResult> BulkUpsertAsync(SqlConnection connection, IEnumerable<TEntity> entities, Action<SqlBulkUpsertOptions> configure,
+        int timeout = 30, SqlBulkCopyOptions sqlBulkCopyOptions = SqlBulkCopyOptions.Default, SqlTransaction? sqlTransaction = null, CancellationToken cancellationToken = default)
+    {
+        return BulkUpsertCoreAsync(connection, (columnDefinitions, onRowRead) => new DisguisedDataReader<TEntity>(columnDefinitions, entities, onRowRead),
+            configure, timeout, sqlBulkCopyOptions, sqlTransaction, cancellationToken);
+    }
+
+    /// <summary>
+    /// Same as the IEnumerable overload, but streams the entities from an IAsyncEnumerable without blocking threads.
+    /// A type that implements both IEnumerable and IAsyncEnumerable (like an EF Core DbSet) uses the IEnumerable overload, call .AsAsyncEnumerable() to use this one.
+    /// </summary>
+    /// <param name="connection">SqlConnection to connect to. If it's closed, this code will open it, do the upsert then close it. If it was open it will be kept open.</param>
+    /// <param name="entities">All the entities that will be inserted or updated</param>
+    /// <param name="configure">Configures the upsert. MatchOn is required.</param>
+    /// <param name="timeout">Number of seconds for each step to complete before it times out. 0 equals no timeout. Default 30 seconds</param>
+    /// <param name="sqlBulkCopyOptions">Options for the SqlBulkCopy to the staging table</param>
+    /// <param name="sqlTransaction">If this should be done in a specific transaction or not. The caller is responsible for commit or rollback.</param>
+    /// <param name="cancellationToken">Cancels the operation. It's also passed to the source when it's enumerated.</param>
+    /// <returns>Number of rows inserted, updated and unchanged</returns>
+    /// <exception cref="InvalidOperationException">If MatchOn is missing, a column in the options is not mapped, or the source has duplicate keys and DuplicateKeyHandling is Throw</exception>
+    public ValueTask<SqlBulkUpsertResult> BulkUpsertAsync(SqlConnection connection, IAsyncEnumerable<TEntity> entities, Action<SqlBulkUpsertOptions> configure,
+        int timeout = 30, SqlBulkCopyOptions sqlBulkCopyOptions = SqlBulkCopyOptions.Default, SqlTransaction? sqlTransaction = null, CancellationToken cancellationToken = default)
+    {
+        return BulkUpsertCoreAsync(connection, (columnDefinitions, onRowRead) => new AsyncDisguisedDataReader<TEntity>(columnDefinitions, entities, cancellationToken, onRowRead),
+            configure, timeout, sqlBulkCopyOptions, sqlTransaction, cancellationToken);
+    }
+
+    private async ValueTask<SqlBulkUpsertResult> BulkUpsertCoreAsync(SqlConnection connection, Func<List<DisguisedColumnDefinition<TEntity>>, Action<TEntity>?, DbDataReader> createReader,
+        Action<SqlBulkUpsertOptions> configure, int timeout, SqlBulkCopyOptions sqlBulkCopyOptions, SqlTransaction? sqlTransaction, CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(configure);
+        cancellationToken.ThrowIfCancellationRequested();
+
+        if (sqlBulkCopyOptions.HasFlag(SqlBulkCopyOptions.KeepIdentity))
+        {
+            throw new NotSupportedException("SqlBulkCopyOptions.KeepIdentity is not supported by BulkUpsertAsync.");
+        }
+
+        if (sqlBulkCopyOptions.HasFlag(SqlBulkCopyOptions.UseInternalTransaction))
+        {
+            throw new NotSupportedException("SqlBulkCopyOptions.UseInternalTransaction is not supported by BulkUpsertAsync, since all steps run in the same transaction.");
+        }
+
+        var options = new SqlBulkUpsertOptions();
+        configure(options);
+        var upsertColumns = GetUpsertColumns(options);
+
+        // The UPDATE and the INSERT should succeed or fail together
+        return await ExecuteAsync(connection, sqlTransaction, useOwnTransaction: sqlTransaction is null,
+            transaction => UpsertAsync(connection, transaction, createReader, upsertColumns, timeout, sqlBulkCopyOptions, cancellationToken),
+            cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Quoted column names for the upsert, validated against the mapping
+    /// </summary>
+    private sealed record UpsertColumns(List<string> Keys, List<string> Updated, bool OnlyUpdateWhenChanged, DuplicateKeyHandling DuplicateKeyHandling);
+
+    private UpsertColumns GetUpsertColumns(SqlBulkUpsertOptions options)
+    {
+        if (options.MatchOnColumns.Count == 0)
+        {
+            throw new InvalidOperationException("BulkUpsertAsync needs to know how to match the rows, call MatchOn with the key columns.");
+        }
+
+        string GetMappedColumnName(string columnName, string option) =>
+            _columnDefinitions.FirstOrDefault(x => string.Equals(x.ColumnName, columnName, StringComparison.OrdinalIgnoreCase))?.ColumnName
+            ?? throw new InvalidOperationException($"{option} column '{columnName}' is not mapped. Only mapped columns can be used in {option}.");
+
+        var keys = options.MatchOnColumns.Select(x => GetMappedColumnName(x, nameof(SqlBulkUpsertOptions.MatchOn))).ToList();
+        var ignored = options.IgnoreOnUpdateColumns.Select(x => GetMappedColumnName(x, nameof(SqlBulkUpsertOptions.IgnoreOnUpdate))).ToList();
+
+        var updated = _columnDefinitions
+            .Select(x => x.ColumnName)
+            .Where(x => !keys.Contains(x) && !ignored.Contains(x))
+            .ToList();
+
+        return new UpsertColumns(keys.Select(QuoteName).ToList(), updated.Select(QuoteName).ToList(), options.UpdateOnlyWhenChanged, options.DuplicateKeyHandling);
+    }
+
+    /// <summary>
+    /// Opens the connection if it's closed, and closes it again when done.
+    /// With useOwnTransaction a transaction is started, committed if work succeeds and rolled back if it fails.
+    /// </summary>
+    private static async ValueTask<T> ExecuteAsync<T>(SqlConnection connection, SqlTransaction? sqlTransaction, bool useOwnTransaction,
+        Func<SqlTransaction?, ValueTask<T>> work, CancellationToken cancellationToken)
+    {
         var closeConnection = false;
         if (connection.State != ConnectionState.Open)
         {
@@ -133,43 +265,21 @@ public class SqlBulkCopyHelper<TEntity>
         SqlTransaction? ownTransaction = null;
         try
         {
-            // CREATE TABLE and the bulk insert should succeed or fail together.
-            // If the caller provides a transaction, it's up to the caller to commit or rollback.
-            var useOwnTransaction = createTableIfNotExists
-                && sqlTransaction is null
-                && !sqlBulkCopyOptions.HasFlag(SqlBulkCopyOptions.UseInternalTransaction);
-
             if (useOwnTransaction)
             {
                 ownTransaction = (SqlTransaction)await connection.BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
             }
 
-            var transaction = sqlTransaction ?? ownTransaction;
-
             try
             {
-                if (createTableIfNotExists)
-                {
-                    var sqlCommand = connection.CreateCommand();
-                    await using (sqlCommand.ConfigureAwait(false))
-                    {
-                        sqlCommand.Transaction = transaction;
-                        sqlCommand.CommandText = CreateTableScript(checkIfTableExists: true);
-                        await sqlCommand.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
-                    }
-                }
-
-                var rows = _outputColumns.Count == 0
-                    ? await WriteToServerAsync(connection, transaction, GetTableName(), createReader(_columnDefinitions, null),
-                        extraColumnMappings: [], timeout, sqlBulkCopyOptions, cancellationToken).ConfigureAwait(false)
-                    : await InsertWithOutputAsync(connection, transaction, createReader, timeout, sqlBulkCopyOptions, cancellationToken).ConfigureAwait(false);
+                var result = await work(sqlTransaction ?? ownTransaction).ConfigureAwait(false);
 
                 if (ownTransaction is not null)
                 {
                     await ownTransaction.CommitAsync(cancellationToken).ConfigureAwait(false);
                 }
 
-                return rows;
+                return result;
             }
             catch when (ownTransaction is not null)
             {
@@ -226,6 +336,19 @@ public class SqlBulkCopyHelper<TEntity>
     }
 
     private const string RowNumberColumnName = "SqlBulkCopyHelper_RowNumber";
+    private static readonly string RowNumberColumn = Quote(RowNumberColumnName);
+
+    /// <summary>
+    /// The temp tables used when inserting with output or upserting. Staging gets the entities, Output gets the values from OUTPUT.
+    /// </summary>
+    private readonly record struct StagingTables(string Staging, string Output)
+    {
+        public static StagingTables Create()
+        {
+            var suffix = Guid.NewGuid().ToString("N");
+            return new StagingTables(Quote("#SqlBulkCopyHelper_Staging_" + suffix), Quote("#SqlBulkCopyHelper_Output_" + suffix));
+        }
+    }
 
     /// <summary>
     /// SqlBulkCopy can't return values generated by the database, so the entities are bulk copied to a staging table together with their row number.
@@ -237,92 +360,282 @@ public class SqlBulkCopyHelper<TEntity>
         int timeout, SqlBulkCopyOptions sqlBulkCopyOptions, CancellationToken cancellationToken)
     {
         var outputColumns = _outputColumns.ToList();
-        var suffix = Guid.NewGuid().ToString("N");
-        var stagingTable = Quote("#SqlBulkCopyHelper_Staging_" + suffix);
-        var outputTable = Quote("#SqlBulkCopyHelper_Output_" + suffix);
-        var targetTable = GetTableName();
-        var rowNumberColumn = Quote(RowNumberColumnName);
-        var columns = _columnDefinitions.Select(x => QuoteName(x.ColumnName)).ToList();
         var outputColumnNames = outputColumns.Select(x => QuoteName(x.ColumnName)).ToList();
+        var tables = StagingTables.Create();
+        var targetTable = GetTableName();
 
         try
         {
-            await ExecuteNonQueryAsync(connection, transaction,
-                CreateEmptyCopyScript(stagingTable, targetTable, rowNumberColumn, columns) +
-                CreateEmptyCopyScript(outputTable, targetTable, rowNumberColumn, outputColumnNames),
-                timeout, cancellationToken).ConfigureAwait(false);
+            await CreateStagingTablesAsync(connection, transaction, tables, targetTable, outputColumnNames, timeout, cancellationToken).ConfigureAwait(false);
 
-            // The row number is the index in this list, so the entity can be found when the output is read
-            var entities = new List<TEntity>();
-            var rowNumberColumnDefinition = new DisguisedColumnDefinition<TEntity>
-            {
-                ColumnName = RowNumberColumnName,
-                Type = typeof(long),
-                Nullable = false,
-                PropertyGetter = _ => (long)(entities.Count - 1)
-            };
+            var (_, entities) = await CopyToStagingAsync(connection, transaction, tables.Staging, createReader, keepEntities: true,
+                timeout, sqlBulkCopyOptions, cancellationToken).ConfigureAwait(false);
 
-            await WriteToServerAsync(connection, transaction, stagingTable, createReader([.. _columnDefinitions, rowNumberColumnDefinition], entities.Add),
-                extraColumnMappings: [(RowNumberColumnName, rowNumberColumn)], timeout, sqlBulkCopyOptions, cancellationToken).ConfigureAwait(false);
+            var sb = new StringBuilder();
+            AppendInsert(sb, targetTable, tables.Staging, MappedColumnNames(), tables, outputColumnNames);
+            AppendSelectOutput(sb, tables, outputColumnNames);
 
-            var command = connection.CreateCommand();
-            await using (command.ConfigureAwait(false))
-            {
-                command.Transaction = transaction;
-                command.CommandTimeout = timeout;
-                command.CommandText = CreateMergeWithOutputScript(targetTable, stagingTable, outputTable, rowNumberColumn, columns, outputColumnNames);
-
-                var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
-                await using (reader.ConfigureAwait(false))
-                {
-                    long rows = 0;
-                    while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
-                    {
-                        var entity = entities[checked((int)reader.GetInt64(0))];
-                        for (var i = 0; i < outputColumns.Count; i++)
-                        {
-                            outputColumns[i].SetValue(entity, reader, i + 1);
-                        }
-
-                        rows++;
-                    }
-
-                    return rows;
-                }
-            }
+            return await ExecuteReaderAsync(connection, transaction, sb.ToString(), timeout,
+                reader => ReadOutputAsync(reader, entities!, outputColumns, cancellationToken), cancellationToken).ConfigureAwait(false);
         }
         finally
         {
-            try
+            await DropStagingTablesAsync(connection, transaction, tables, timeout).ConfigureAwait(false);
+        }
+    }
+
+    private async ValueTask<SqlBulkUpsertResult> UpsertAsync(SqlConnection connection, SqlTransaction? transaction,
+        Func<List<DisguisedColumnDefinition<TEntity>>, Action<TEntity>?, DbDataReader> createReader, UpsertColumns upsertColumns,
+        int timeout, SqlBulkCopyOptions sqlBulkCopyOptions, CancellationToken cancellationToken)
+    {
+        var outputColumns = _outputColumns.ToList();
+        var outputColumnNames = outputColumns.Select(x => QuoteName(x.ColumnName)).ToList();
+        var tables = StagingTables.Create();
+        var targetTable = GetTableName();
+
+        try
+        {
+            await CreateStagingTablesAsync(connection, transaction, tables, targetTable, outputColumnNames, timeout, cancellationToken).ConfigureAwait(false);
+
+            // The entities are only needed to set the output values on them
+            var (stagedRows, entities) = await CopyToStagingAsync(connection, transaction, tables.Staging, createReader, keepEntities: outputColumns.Count > 0,
+                timeout, sqlBulkCopyOptions, cancellationToken).ConfigureAwait(false);
+
+            // An UPDATE where several source rows match the same row would use one of them at random, so duplicates are handled first
+            var duplicatesRemoved = await HandleDuplicateKeysAsync(connection, transaction, tables, upsertColumns, timeout, cancellationToken).ConfigureAwait(false);
+
+            var sql = CreateUpsertScript(targetTable, tables, upsertColumns, MappedColumnNames(), outputColumnNames);
+
+            return await ExecuteReaderAsync(connection, transaction, sql, timeout, async reader =>
             {
-                // The tables are gone if the connection is closed or the transaction is rolled back, but not if the caller keeps using the connection
-                await ExecuteNonQueryAsync(connection, transaction,
-                    $"DROP TABLE IF EXISTS {stagingTable};{Environment.NewLine}DROP TABLE IF EXISTS {outputTable};",
-                    timeout, CancellationToken.None).ConfigureAwait(false);
-            }
-            catch
+                await reader.ReadAsync(cancellationToken).ConfigureAwait(false);
+                var inserted = reader.GetInt64(0);
+                var updated = reader.GetInt64(1);
+
+                if (outputColumns.Count > 0)
+                {
+                    await reader.NextResultAsync(cancellationToken).ConfigureAwait(false);
+                    await ReadOutputAsync(reader, entities!, outputColumns, cancellationToken).ConfigureAwait(false);
+                }
+
+                return new SqlBulkUpsertResult(inserted, updated, stagedRows - duplicatesRemoved - inserted - updated, duplicatesRemoved);
+            }, cancellationToken).ConfigureAwait(false);
+        }
+        finally
+        {
+            await DropStagingTablesAsync(connection, transaction, tables, timeout).ConfigureAwait(false);
+        }
+    }
+
+    private List<string> MappedColumnNames() => _columnDefinitions.Select(x => QuoteName(x.ColumnName)).ToList();
+
+    /// <summary>
+    /// The output table is only created if there are output columns
+    /// </summary>
+    private Task CreateStagingTablesAsync(SqlConnection connection, SqlTransaction? transaction, StagingTables tables, string targetTable,
+        List<string> outputColumnNames, int timeout, CancellationToken cancellationToken)
+    {
+        var sql = CreateEmptyCopyScript(tables.Staging, targetTable, MappedColumnNames());
+        if (outputColumnNames.Count > 0)
+        {
+            sql += CreateEmptyCopyScript(tables.Output, targetTable, outputColumnNames);
+        }
+
+        return ExecuteNonQueryAsync(connection, transaction, sql, timeout, cancellationToken);
+    }
+
+    /// <summary>
+    /// Copies the entities to the staging table together with their row number, which starts at 0 and is the index in the source.
+    /// </summary>
+    /// <returns>Number of rows copied, and the entities in row number order if keepEntities is true</returns>
+    private async ValueTask<(long Rows, List<TEntity>? Entities)> CopyToStagingAsync(SqlConnection connection, SqlTransaction? transaction, string stagingTable,
+        Func<List<DisguisedColumnDefinition<TEntity>>, Action<TEntity>?, DbDataReader> createReader, bool keepEntities,
+        int timeout, SqlBulkCopyOptions sqlBulkCopyOptions, CancellationToken cancellationToken)
+    {
+        var entities = keepEntities ? new List<TEntity>() : null;
+        var rowNumber = -1L;
+
+        var rowNumberColumnDefinition = new DisguisedColumnDefinition<TEntity>
+        {
+            ColumnName = RowNumberColumnName,
+            Type = typeof(long),
+            Nullable = false,
+            PropertyGetter = _ => rowNumber
+        };
+
+        Action<TEntity> onRowRead = entities is null
+            ? _ => rowNumber++
+            : entity =>
             {
-                // A failed clean-up should not hide the original exception, for example if the transaction is doomed
+                rowNumber++;
+                entities.Add(entity);
+            };
+
+        var rows = await WriteToServerAsync(connection, transaction, stagingTable, createReader([.. _columnDefinitions, rowNumberColumnDefinition], onRowRead),
+            extraColumnMappings: [(RowNumberColumnName, RowNumberColumn)], timeout, sqlBulkCopyOptions, cancellationToken).ConfigureAwait(false);
+
+        return (rows, entities);
+    }
+
+    /// <returns>Number of rows removed from the staging table</returns>
+    private static async ValueTask<long> HandleDuplicateKeysAsync(SqlConnection connection, SqlTransaction? transaction, StagingTables tables,
+        UpsertColumns upsertColumns, int timeout, CancellationToken cancellationToken)
+    {
+        var keyList = string.Join(", ", upsertColumns.Keys);
+
+        if (upsertColumns.DuplicateKeyHandling == DuplicateKeyHandling.Throw)
+        {
+            var sql = $"SELECT TOP (5) {keyList}, MIN({RowNumberColumn}), MAX({RowNumberColumn}), COUNT_BIG(*) FROM {tables.Staging}{Environment.NewLine}" +
+                      $"GROUP BY {keyList} HAVING COUNT_BIG(*) > 1 ORDER BY MIN({RowNumberColumn});";
+
+            var duplicates = await ExecuteReaderAsync(connection, transaction, sql, timeout, async reader =>
+            {
+                var result = new List<string>();
+                while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+                {
+                    var keys = string.Join(", ", Enumerable.Range(0, upsertColumns.Keys.Count).Select(i => FormatValue(reader.GetValue(i))));
+                    var count = upsertColumns.Keys.Count;
+                    result.Add($"({keys}) {reader.GetInt64(count + 2)} times, first at index {reader.GetInt64(count)} and last at index {reader.GetInt64(count + 1)}");
+                }
+
+                return result;
+            }, cancellationToken).ConfigureAwait(false);
+
+            if (duplicates.Count > 0)
+            {
+                throw new InvalidOperationException(
+                    $"The source has more than one row with the same key ({keyList}): {string.Join("; ", duplicates)}. " +
+                    $"Use OnDuplicateKey(DuplicateKeyHandling.KeepFirst) or KeepLast to keep one of them.");
             }
+
+            return 0;
+        }
+
+        var order = upsertColumns.DuplicateKeyHandling == DuplicateKeyHandling.KeepFirst ? "ASC" : "DESC";
+        var deleteSql = $"WITH D AS (SELECT ROW_NUMBER() OVER (PARTITION BY {keyList} ORDER BY {RowNumberColumn} {order}) AS N FROM {tables.Staging}){Environment.NewLine}" +
+                        $"DELETE FROM D WHERE N > 1;{Environment.NewLine}" +
+                        "SELECT CAST(@@ROWCOUNT AS bigint);";
+
+        return await ExecuteReaderAsync(connection, transaction, deleteSql, timeout, async reader =>
+        {
+            await reader.ReadAsync(cancellationToken).ConfigureAwait(false);
+            return reader.GetInt64(0);
+        }, cancellationToken).ConfigureAwait(false);
+    }
+
+    private static string FormatValue(object value) => value switch
+    {
+        DBNull => "NULL",
+        string s => "'" + s + "'",
+        IFormattable formattable => formattable.ToString(null, CultureInfo.InvariantCulture),
+        _ => value.ToString() ?? ""
+    };
+
+    /// <summary>
+    /// Returns the number of inserted and updated rows, and then the output values if there are output columns.
+    /// </summary>
+    private static string CreateUpsertScript(string targetTable, StagingTables tables, UpsertColumns upsertColumns, List<string> columns, List<string> outputColumnNames)
+    {
+        var keyMatch = string.Join(" AND ", upsertColumns.Keys.Select(x => $"T.{x} = S.{x}"));
+        var sb = new StringBuilder();
+        sb.AppendLine("DECLARE @Inserted bigint = 0, @Updated bigint = 0;");
+
+        if (upsertColumns.Updated.Count > 0)
+        {
+            sb.Append("UPDATE T SET ").AppendJoin(", ", upsertColumns.Updated.Select(x => $"T.{x} = S.{x}")).AppendLine();
+            AppendOutputInto(sb, tables, outputColumnNames);
+            sb.Append("FROM ").Append(targetTable).AppendLine(" AS T WITH (UPDLOCK, HOLDLOCK)");
+            sb.Append("JOIN ").Append(tables.Staging).Append(" AS S ON ").AppendLine(keyMatch);
+
+            if (upsertColumns.OnlyUpdateWhenChanged)
+            {
+                // EXCEPT considers NULL equal to NULL, which <> doesn't
+                sb.Append("WHERE EXISTS (SELECT ").AppendJoin(", ", upsertColumns.Updated.Select(x => "S." + x))
+                    .Append(" EXCEPT SELECT ").AppendJoin(", ", upsertColumns.Updated.Select(x => "T." + x)).AppendLine(")");
+            }
+
+            sb.AppendLine(";");
+            sb.AppendLine("SET @Updated = @@ROWCOUNT;");
+        }
+
+        // The rows that don't exist in the table. HOLDLOCK keeps the range locked, so no one else can insert the same key until the transaction is done.
+        var newRows = $"(SELECT * FROM {tables.Staging} AS S WHERE NOT EXISTS (SELECT 1 FROM {targetTable} AS T WITH (UPDLOCK, HOLDLOCK) WHERE {keyMatch}))";
+        AppendInsert(sb, targetTable, newRows, columns, tables, outputColumnNames);
+        sb.AppendLine("SET @Inserted = @@ROWCOUNT;");
+
+        // Rows that matched but were not updated should also get their output values
+        if (outputColumnNames.Count > 0 && (upsertColumns.Updated.Count == 0 || upsertColumns.OnlyUpdateWhenChanged))
+        {
+            sb.Append("INSERT INTO ").Append(tables.Output).Append(" (").Append(RowNumberColumn).Append(string.Concat(outputColumnNames.Select(x => ", " + x))).AppendLine(")");
+            sb.Append("SELECT S.").Append(RowNumberColumn).Append(string.Concat(outputColumnNames.Select(x => ", T." + x)))
+                .Append(" FROM ").Append(tables.Staging).Append(" AS S JOIN ").Append(targetTable).Append(" AS T ON ").AppendLine(keyMatch);
+            sb.Append("WHERE NOT EXISTS (SELECT 1 FROM ").Append(tables.Output).Append(" AS O WHERE O.").Append(RowNumberColumn).Append(" = S.").Append(RowNumberColumn).AppendLine(");");
+        }
+
+        sb.AppendLine("SELECT @Inserted, @Updated;");
+
+        if (outputColumnNames.Count > 0)
+        {
+            AppendSelectOutput(sb, tables, outputColumnNames);
+        }
+
+        return sb.ToString();
+    }
+
+    /// <summary>
+    /// Reads the row number and the output columns, and sets the values on the entity with that row number.
+    /// </summary>
+    /// <returns>Number of rows read</returns>
+    private static async ValueTask<long> ReadOutputAsync(SqlDataReader reader, List<TEntity> entities, List<OutputColumnDefinition<TEntity>> outputColumns,
+        CancellationToken cancellationToken)
+    {
+        long rows = 0;
+        while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+        {
+            var entity = entities[checked((int)reader.GetInt64(0))];
+            for (var i = 0; i < outputColumns.Count; i++)
+            {
+                outputColumns[i].SetValue(entity, reader, i + 1);
+            }
+
+            rows++;
+        }
+
+        return rows;
+    }
+
+    private static async ValueTask DropStagingTablesAsync(SqlConnection connection, SqlTransaction? transaction, StagingTables tables, int timeout)
+    {
+        try
+        {
+            // The tables are gone if the connection is closed or the transaction is rolled back, but not if the caller keeps using the connection
+            await ExecuteNonQueryAsync(connection, transaction,
+                $"DROP TABLE IF EXISTS {tables.Staging};{Environment.NewLine}DROP TABLE IF EXISTS {tables.Output};",
+                timeout, CancellationToken.None).ConfigureAwait(false);
+        }
+        catch
+        {
+            // A failed clean-up should not hide the original exception, for example if the transaction is doomed
         }
     }
 
     /// <summary>
-    /// Creates an empty table with the same column types as the target table. The UNION ALL makes sure an IDENTITY is not copied.
+    /// Creates an empty table with the row number column and the same column types as the target table. The UNION ALL makes sure an IDENTITY is not copied.
     /// </summary>
-    private static string CreateEmptyCopyScript(string tableName, string targetTable, string rowNumberColumn, List<string> columns)
+    private static string CreateEmptyCopyScript(string tableName, string targetTable, List<string> columns)
     {
         var columnList = string.Concat(columns.Select(x => ", " + x));
-        return $"SELECT TOP (0) CAST(0 AS bigint) AS {rowNumberColumn}{columnList} INTO {tableName} FROM {targetTable}{Environment.NewLine}" +
+        return $"SELECT TOP (0) CAST(0 AS bigint) AS {RowNumberColumn}{columnList} INTO {tableName} FROM {targetTable}{Environment.NewLine}" +
                $"UNION ALL SELECT TOP (0) CAST(0 AS bigint){columnList} FROM {targetTable};{Environment.NewLine}";
     }
 
-    private static string CreateMergeWithOutputScript(string targetTable, string stagingTable, string outputTable, string rowNumberColumn,
-        List<string> columns, List<string> outputColumns)
+    /// <summary>
+    /// A MERGE that never matches, so all rows in source are inserted. The source must have the alias S.
+    /// </summary>
+    private static void AppendInsert(StringBuilder sb, string targetTable, string source, List<string> columns, StagingTables tables, List<string> outputColumnNames)
     {
-        var sb = new StringBuilder();
         sb.Append("MERGE INTO ").Append(targetTable).AppendLine(" AS T");
-        sb.Append("USING ").Append(stagingTable).AppendLine(" AS S ON 1 = 0");
+        sb.Append("USING ").Append(source).AppendLine(" AS S ON 1 = 0");
         sb.Append("WHEN NOT MATCHED THEN INSERT ");
 
         if (columns.Count == 0)
@@ -334,14 +647,28 @@ public class SqlBulkCopyHelper<TEntity>
             sb.Append('(').AppendJoin(", ", columns).Append(") VALUES (").AppendJoin(", ", columns.Select(x => "S." + x)).AppendLine(")");
         }
 
-        // OUTPUT INTO, since OUTPUT directly to the client is not allowed if the target table has triggers
-        sb.Append("OUTPUT S.").Append(rowNumberColumn).Append(string.Concat(outputColumns.Select(x => ", inserted." + x)))
-            .Append(" INTO ").Append(outputTable).Append(" (").Append(rowNumberColumn).Append(string.Concat(outputColumns.Select(x => ", " + x))).AppendLine(");");
+        AppendOutputInto(sb, tables, outputColumnNames);
+        sb.AppendLine(";");
+    }
 
-        sb.Append("SELECT ").Append(rowNumberColumn).Append(string.Concat(outputColumns.Select(x => ", " + x)))
-            .Append(" FROM ").Append(outputTable).Append(" ORDER BY ").Append(rowNumberColumn).AppendLine(";");
+    /// <summary>
+    /// OUTPUT INTO, since OUTPUT directly to the client is not allowed if the target table has triggers. Nothing is added without output columns.
+    /// </summary>
+    private static void AppendOutputInto(StringBuilder sb, StagingTables tables, List<string> outputColumnNames)
+    {
+        if (outputColumnNames.Count == 0)
+        {
+            return;
+        }
 
-        return sb.ToString();
+        sb.Append("OUTPUT S.").Append(RowNumberColumn).Append(string.Concat(outputColumnNames.Select(x => ", inserted." + x)))
+            .Append(" INTO ").Append(tables.Output).Append(" (").Append(RowNumberColumn).Append(string.Concat(outputColumnNames.Select(x => ", " + x))).AppendLine(")");
+    }
+
+    private static void AppendSelectOutput(StringBuilder sb, StagingTables tables, List<string> outputColumnNames)
+    {
+        sb.Append("SELECT ").Append(RowNumberColumn).Append(string.Concat(outputColumnNames.Select(x => ", " + x)))
+            .Append(" FROM ").Append(tables.Output).Append(" ORDER BY ").Append(RowNumberColumn).AppendLine(";");
     }
 
     private static async Task ExecuteNonQueryAsync(SqlConnection connection, SqlTransaction? transaction, string sql, int timeout, CancellationToken cancellationToken)
@@ -353,6 +680,24 @@ public class SqlBulkCopyHelper<TEntity>
             command.CommandTimeout = timeout;
             command.CommandText = sql;
             await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+        }
+    }
+
+    private static async ValueTask<T> ExecuteReaderAsync<T>(SqlConnection connection, SqlTransaction? transaction, string sql, int timeout,
+        Func<SqlDataReader, ValueTask<T>> read, CancellationToken cancellationToken)
+    {
+        var command = connection.CreateCommand();
+        await using (command.ConfigureAwait(false))
+        {
+            command.Transaction = transaction;
+            command.CommandTimeout = timeout;
+            command.CommandText = sql;
+
+            var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+            await using (reader.ConfigureAwait(false))
+            {
+                return await read(reader).ConfigureAwait(false);
+            }
         }
     }
 
