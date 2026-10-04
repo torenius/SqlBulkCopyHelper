@@ -222,6 +222,186 @@ public class SqlBulkCopyHelper<TEntity>
     }
 
     /// <summary>
+    /// Replaces all rows in the table with the entities, without readers ever seeing the table empty or half-filled.
+    /// <para>
+    /// The entities are bulk copied to a new table with the same columns, indexes and constraints, named like "Table_Incoming_20261004153012" (UTC).
+    /// Then, in a short transaction, the old rows are switched out to "Table_Outgoing_20261004153012" and the new rows are switched in, with ALTER TABLE SWITCH that only changes metadata.
+    /// Both tables are dropped afterwards. If something fails before the swap, the table is unchanged. If the process is killed, the tables can be left behind and dropped.
+    /// </para>
+    /// <para>
+    /// The table keeps its own object, so permissions, triggers and names stay as they are. Triggers don't fire for the new rows.
+    /// The swap needs a schema modification lock and waits for readers that hold locks on the table, see SqlBulkReplaceOptions.WaitAtLowPriority.
+    /// A SNAPSHOT transaction that started before the swap fails if it reads the table after it.
+    /// </para>
+    /// </summary>
+    /// <param name="connection">SqlConnection to connect to. If it's closed, this code will open it, do the replace then close it. If it was open it will be kept open. It can't have an ongoing transaction.</param>
+    /// <param name="entities">All the rows the table should have</param>
+    /// <param name="configure">Configures the swap, for example WaitAtLowPriority</param>
+    /// <param name="timeout">Number of seconds for each step to complete before it times out, like the bulk copy, creating the indexes and the swap. 0 equals no timeout. Default 30 seconds</param>
+    /// <param name="sqlBulkCopyOptions">Options for the SqlBulkCopy to the incoming table. TableLock is always used, since no one else uses that table.</param>
+    /// <param name="cancellationToken">Do you like to have the option to cancel the operation?</param>
+    /// <returns>Number of rows in the table</returns>
+    /// <exception cref="InvalidOperationException">If the table doesn't exist</exception>
+    /// <exception cref="NotSupportedException">If the table is a temp table, is referenced by a foreign key, has Change Tracking, is partitioned, temporal or memory-optimized, or OutputColumn is used</exception>
+    // Preferred over the IAsyncEnumerable overload for types that implement both, like an EF Core DbSet
+    [OverloadResolutionPriority(1)]
+    public ValueTask<long> BulkReplaceAsync(SqlConnection connection, IEnumerable<TEntity> entities, Action<SqlBulkReplaceOptions>? configure = null,
+        int timeout = 30, SqlBulkCopyOptions sqlBulkCopyOptions = SqlBulkCopyOptions.Default, CancellationToken cancellationToken = default)
+    {
+        return BulkReplaceCoreAsync(connection, columnDefinitions => new DisguisedDataReader<TEntity>(columnDefinitions, entities),
+            configure, timeout, sqlBulkCopyOptions, cancellationToken);
+    }
+
+    /// <summary>
+    /// Same as the IEnumerable overload, but streams the entities from an IAsyncEnumerable without blocking threads.
+    /// A type that implements both IEnumerable and IAsyncEnumerable (like an EF Core DbSet) uses the IEnumerable overload, call .AsAsyncEnumerable() to use this one.
+    /// </summary>
+    /// <param name="connection">SqlConnection to connect to. If it's closed, this code will open it, do the replace then close it. If it was open it will be kept open. It can't have an ongoing transaction.</param>
+    /// <param name="entities">All the rows the table should have</param>
+    /// <param name="configure">Configures the swap, for example WaitAtLowPriority</param>
+    /// <param name="timeout">Number of seconds for each step to complete before it times out, like the bulk copy, creating the indexes and the swap. 0 equals no timeout. Default 30 seconds</param>
+    /// <param name="sqlBulkCopyOptions">Options for the SqlBulkCopy to the incoming table. TableLock is always used, since no one else uses that table.</param>
+    /// <param name="cancellationToken">Cancels the operation. It's also passed to the source when it's enumerated.</param>
+    /// <returns>Number of rows in the table</returns>
+    /// <exception cref="InvalidOperationException">If the table doesn't exist</exception>
+    /// <exception cref="NotSupportedException">If the table is a temp table, is referenced by a foreign key, has Change Tracking, is partitioned, temporal or memory-optimized, or OutputColumn is used</exception>
+    public ValueTask<long> BulkReplaceAsync(SqlConnection connection, IAsyncEnumerable<TEntity> entities, Action<SqlBulkReplaceOptions>? configure = null,
+        int timeout = 30, SqlBulkCopyOptions sqlBulkCopyOptions = SqlBulkCopyOptions.Default, CancellationToken cancellationToken = default)
+    {
+        return BulkReplaceCoreAsync(connection, columnDefinitions => new AsyncDisguisedDataReader<TEntity>(columnDefinitions, entities, cancellationToken),
+            configure, timeout, sqlBulkCopyOptions, cancellationToken);
+    }
+
+    private async ValueTask<long> BulkReplaceCoreAsync(SqlConnection connection, Func<List<DisguisedColumnDefinition<TEntity>>, DbDataReader> createReader,
+        Action<SqlBulkReplaceOptions>? configure, int timeout, SqlBulkCopyOptions sqlBulkCopyOptions, CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+
+        if (_outputColumns.Count > 0)
+        {
+            throw new NotSupportedException("OutputColumn can't be combined with BulkReplaceAsync.");
+        }
+
+        if (_tableNameParts.Count > 2)
+        {
+            throw new NotSupportedException($"BulkReplaceAsync only supports tables in the current database, so '{_tableName}' can't have a database part.");
+        }
+
+        if (Unquote(_tableNameParts[^1]).StartsWith('#'))
+        {
+            throw new NotSupportedException("BulkReplaceAsync doesn't support temp tables, since no one else can read them. Use TRUNCATE TABLE and BulkInsertAsync instead.");
+        }
+
+        var options = new SqlBulkReplaceOptions();
+        configure?.Invoke(options);
+
+        return await ExecuteAsync(connection, sqlTransaction: null, useOwnTransaction: false,
+            _ => ReplaceAsync(connection, createReader, options, timeout, sqlBulkCopyOptions, cancellationToken),
+            cancellationToken).ConfigureAwait(false);
+    }
+
+    private async ValueTask<long> ReplaceAsync(SqlConnection connection, Func<List<DisguisedColumnDefinition<TEntity>>, DbDataReader> createReader,
+        SqlBulkReplaceOptions options, int timeout, SqlBulkCopyOptions sqlBulkCopyOptions, CancellationToken cancellationToken)
+    {
+        var table = await TableStructure.ReadAsync(connection, GetTableName(), timeout, cancellationToken).ConfigureAwait(false);
+        var (incoming, outgoing) = CreateSwapTableNames(table);
+
+        // Only the tables created here are dropped, a table with the same name could belong to another replace
+        var dropTables = new List<string>();
+        try
+        {
+            await ExecuteNonQueryAsync(connection, null, table.CreateTableScript(incoming), timeout, cancellationToken).ConfigureAwait(false);
+            dropTables.Add(incoming);
+            await ExecuteNonQueryAsync(connection, null, table.CreateTableScript(outgoing), timeout, cancellationToken).ConfigureAwait(false);
+            dropTables.Add(outgoing);
+
+            // No one else uses the incoming table, so it's locked for a faster load
+            var rows = await WriteToServerAsync(connection, null, incoming, createReader(_columnDefinitions), extraColumnMappings: [], timeout,
+                sqlBulkCopyOptions | SqlBulkCopyOptions.TableLock, cancellationToken).ConfigureAwait(false);
+
+            var indexesAndConstraints = table.CreateIndexesAndConstraintsScript(incoming);
+            if (indexesAndConstraints.Length > 0)
+            {
+                await ExecuteNonQueryAsync(connection, null, indexesAndConstraints, timeout, cancellationToken).ConfigureAwait(false);
+            }
+
+            await SwapAsync(connection, table, incoming, outgoing, options, timeout, cancellationToken).ConfigureAwait(false);
+            return rows;
+        }
+        finally
+        {
+            // After the swap the outgoing table has the old rows, and if the swap didn't happen the incoming table has the new rows
+            if (dropTables.Count > 0)
+            {
+                try
+                {
+                    await ExecuteNonQueryAsync(connection, null, string.Concat(dropTables.Select(x => $"DROP TABLE IF EXISTS {x};{Environment.NewLine}")),
+                        timeout, CancellationToken.None).ConfigureAwait(false);
+                }
+                catch
+                {
+                    // A failed clean-up should not hide the original exception
+                }
+            }
+        }
+    }
+
+    /// <summary>
+    /// The old rows are switched out to the empty outgoing table and then the new rows are switched in, since SWITCH can only switch into an empty table.
+    /// Switching out, instead of TRUNCATE, makes it possible to wait at low priority, and the old rows are dropped after the transaction.
+    /// </summary>
+    private static async Task SwapAsync(SqlConnection connection, TableStructure table, string incoming, string outgoing, SqlBulkReplaceOptions options,
+        int timeout, CancellationToken cancellationToken)
+    {
+        var sb = new StringBuilder();
+        sb.Append("ALTER TABLE ").Append(table.QuotedName).Append(" SWITCH TO ").Append(outgoing);
+
+        var swapTimeout = timeout;
+        if (options.LowPriorityMaxDurationMinutes is { } minutes)
+        {
+            sb.Append(" WITH (WAIT_AT_LOW_PRIORITY (MAX_DURATION = ").Append(minutes.ToString(CultureInfo.InvariantCulture))
+                .Append(" MINUTES, ABORT_AFTER_WAIT = ").Append(options.AbortAfterWait.ToString().ToUpperInvariant()).Append("))");
+
+            // The wait is part of the command, so it shouldn't time out before the wait is over
+            swapTimeout = timeout == 0 ? 0 : timeout + minutes * 60;
+        }
+
+        sb.AppendLine(";");
+
+        // The table is already locked by the first SWITCH, so this doesn't wait
+        sb.Append("ALTER TABLE ").Append(incoming).Append(" SWITCH TO ").Append(table.QuotedName).AppendLine(";");
+
+        if (table.HasIdentity)
+        {
+            // SWITCH doesn't update the identity of the table, so the next insert could get a value that one of the new rows already has
+            sb.Append("DBCC CHECKIDENT (N'").Append(table.QuotedName.Replace("'", "''")).AppendLine("', RESEED) WITH NO_INFOMSGS;");
+        }
+
+        await ExecuteAsync(connection, sqlTransaction: null, useOwnTransaction: true, async transaction =>
+        {
+            await ExecuteNonQueryAsync(connection, transaction, sb.ToString(), swapTimeout, cancellationToken).ConfigureAwait(false);
+            return true;
+        }, cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// The incoming and outgoing tables, in the same schema as the table since SWITCH requires it. A long table name is shortened, since a name can be at most 128 characters.
+    /// </summary>
+    private static (string Incoming, string Outgoing) CreateSwapTableNames(TableStructure table)
+    {
+        var timestamp = DateTime.UtcNow.ToString("yyyyMMddHHmmss", CultureInfo.InvariantCulture);
+
+        string CreateName(string kind)
+        {
+            var suffix = "_" + kind + "_" + timestamp;
+            var name = table.TableName.Length + suffix.Length > 128 ? table.TableName[..(128 - suffix.Length)] : table.TableName;
+            return Quote(table.SchemaName) + "." + Quote(name + suffix);
+        }
+
+        return (CreateName("Incoming"), CreateName("Outgoing"));
+    }
+
+    /// <summary>
     /// Quoted column names for the upsert, validated against the mapping
     /// </summary>
     private sealed record UpsertColumns(List<string> Keys, List<string> Updated, bool OnlyUpdateWhenChanged, DuplicateKeyHandling DuplicateKeyHandling);

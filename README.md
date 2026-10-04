@@ -149,6 +149,32 @@ How it works: the rows are bulk copied to a staging temp table. In one transacti
 - Without `OutputColumn` the entities are not kept in memory, so it works well with a large `IAsyncEnumerable`.
 - `SqlBulkCopyOptions.KeepIdentity` and `UseInternalTransaction` are not supported.
 
+### Replace all rows, without readers seeing an empty table
+`BulkReplaceAsync` replaces all rows in a table, for example a staging table that other services read while it's refilled. Readers see either all the old rows or all the new rows, never an empty or half-filled table.
+```csharp
+var rows = await new SqlBulkCopyHelper<Booking>("dbo.BookingStaging")
+            .MapAllPublicProperties()
+            .BulkReplaceAsync(connection, bookings, replace => replace
+                .WaitAtLowPriority(5), // Optional, see below
+                timeout: 300);
+```
+
+How it works:
+1. A copy of the table is created, with the same columns, clustered index, defaults and identity, named like `BookingStaging_Incoming_20261004153012` (UTC). An empty `BookingStaging_Outgoing_20261004153012` is also created.
+2. The rows are bulk copied to the incoming table, with `TableLock` since no one else uses it. Readers of the table are not affected, however long it takes.
+3. The nonclustered indexes, CHECK constraints and foreign keys are created on the incoming table. Constraints are checked here, so a row that breaks one fails the replace.
+4. In a short transaction, `ALTER TABLE ... SWITCH` moves the old rows to the outgoing table and the new rows into the table. It only changes metadata, so it's fast no matter how many rows there are.
+5. Both tables are dropped. If something fails before the swap, the table is unchanged. If the process is killed, `*_Incoming_*` and `*_Outgoing_*` tables can be left behind, and can be dropped.
+
+Good to know:
+- The table keeps its own object, so permissions, triggers and names stay as they are. Triggers don't fire for the new rows.
+- The identity of the table is reseeded with `DBCC CHECKIDENT`, so the next insert doesn't get an Id that one of the new rows already has.
+- The swap needs a schema modification lock, so it waits for readers that hold a lock on the table, and new readers queue behind it. With `WaitAtLowPriority(minutes)` new readers are not blocked while the swap waits. After the wait it gives up and throws, or with `AbortAfterWait.None` it continues to wait at normal priority, or with `AbortAfterWait.Blockers` it kills the blocking transactions.
+- A `SNAPSHOT` transaction that started before the swap fails if it reads the table after it (error 3961).
+- `timeout` is for each step, like the bulk copy, creating the indexes and the swap.
+- Requires `CREATE TABLE` and `ALTER` on the schema, and for a table with an identity column permission to run `DBCC CHECKIDENT`.
+- Not supported: temp tables, tables that are referenced by a foreign key, Change Tracking, partitioned, temporal, memory-optimized and graph tables, XML, spatial and full-text indexes, and `OutputColumn`.
+
 ### Naming convention
 `MapAllPublicProperties` will by default just use PropertyInfo.Name  
 You can change the behavior by providing a function.
