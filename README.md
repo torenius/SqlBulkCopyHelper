@@ -175,6 +175,22 @@ Good to know:
 - Requires `CREATE TABLE` and `ALTER` on the schema, and for a table with an identity column permission to run `DBCC CHECKIDENT`.
 - Not supported: temp tables, tables that are referenced by a foreign key, Change Tracking, partitioned, temporal, memory-optimized and graph tables, XML, spatial and full-text indexes, and `OutputColumn`.
 
+#### Replace from a DataTable or a DbDataReader
+If you already have code that fills a `DataTable`, or you want to copy a table from another database, there are SqlConnection extensions for them as well as for entities.
+```csharp
+await connection.BulkReplaceAsync("dbo.BookingStaging", bookings); // Maps all public properties, like BulkInsertAsync
+await connection.BulkReplaceAsync("dbo.BookingStaging", dataTable);
+
+// Streamed from another database, without loading the rows into memory
+await using var command = new SqlCommand("SELECT * FROM dbo.Bookings", sourceConnection);
+await using var reader = await command.ExecuteReaderAsync();
+await connection.BulkReplaceAsync("dbo.BookingStaging", reader, replace => replace.WaitAtLowPriority(5), timeout: 300);
+```
+- The columns are mapped by name, not by position like SqlBulkCopy does without column mappings. A column that doesn't exist in the table throws an exception before anything is changed.
+- `configureBulkCopy` is called after the column mappings are added, so you can `Clear()` them and add your own if your code relies on the position of the columns.
+- Deleted rows in a `DataTable` are skipped, like `SqlBulkCopy.WriteToServer(DataTable)` does.
+- The reader is not disposed. It must be read on another connection, unless the connection has `MultipleActiveResultSets`.
+
 ### Naming convention
 `MapAllPublicProperties` will by default just use PropertyInfo.Name  
 You can change the behavior by providing a function.

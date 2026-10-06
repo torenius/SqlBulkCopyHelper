@@ -7,6 +7,7 @@ using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.Data.SqlClient;
+using static SqlBulkCopyHelper.SqlNames;
 
 namespace SqlBulkCopyHelper;
 
@@ -24,10 +25,12 @@ internal sealed class TableStructure
     private readonly List<Constraint> _constraints;
     private readonly string? _lobDataSpace;
 
-    private TableStructure(string schemaName, string tableName, List<string> columns, bool hasIdentity, List<Index> indexes, List<Constraint> constraints, string? lobDataSpace)
+    private TableStructure(string schemaName, string tableName, List<string> columnNames, List<string> columns, bool hasIdentity, List<Index> indexes,
+        List<Constraint> constraints, string? lobDataSpace)
     {
         SchemaName = schemaName;
         TableName = tableName;
+        ColumnNames = columnNames;
         _columns = columns;
         HasIdentity = hasIdentity;
         _indexes = indexes;
@@ -38,6 +41,7 @@ internal sealed class TableStructure
     public string SchemaName { get; }
     public string TableName { get; }
     public string QuotedName => Quote(SchemaName) + "." + Quote(TableName);
+    public IReadOnlyList<string> ColumnNames { get; }
     public bool HasIdentity { get; }
 
     private sealed record Index(string Name, byte Type, bool IsUnique, bool IsPrimaryKey, bool IsUniqueConstraint, string? Filter, bool IgnoreDupKey, bool IsDisabled,
@@ -328,6 +332,7 @@ internal sealed class TableStructure
         }
 
         await reader.NextResultAsync(cancellationToken).ConfigureAwait(false);
+        var columnNames = new List<string>();
         var columns = new List<string>();
         var hasIdentity = false;
         while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
@@ -339,6 +344,7 @@ internal sealed class TableStructure
             }
 
             hasIdentity |= reader.GetBoolean(8);
+            columnNames.Add(columnName);
             columns.Add(GetColumnDefinition(reader, columnName));
         }
 
@@ -411,7 +417,7 @@ internal sealed class TableStructure
             constraints.Add(new Constraint(definition, foreignKey.IsTrusted, foreignKey.IsDisabled));
         }
 
-        return new TableStructure(schemaName, name, columns, hasIdentity, indexes.Values.ToList(), constraints, lobDataSpace);
+        return new TableStructure(schemaName, name, columnNames, columns, hasIdentity, indexes.Values.ToList(), constraints, lobDataSpace);
     }
 
     private static string GetColumnDefinition(SqlDataReader reader, string columnName)
@@ -490,6 +496,4 @@ internal sealed class TableStructure
 
     private static NotSupportedException NotSupported(string quotedName, string reason) =>
         new($"BulkReplaceAsync doesn't support {quotedName}, since it {reason}.");
-
-    private static string Quote(string name) => "[" + name.Replace("]", "]]") + "]";
 }

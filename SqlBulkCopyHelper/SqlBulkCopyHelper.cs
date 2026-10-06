@@ -11,6 +11,8 @@ using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.Data.SqlClient;
+using static SqlBulkCopyHelper.SqlExecution;
+using static SqlBulkCopyHelper.SqlNames;
 
 namespace SqlBulkCopyHelper;
 
@@ -241,7 +243,7 @@ public class SqlBulkCopyHelper<TEntity>
     /// <param name="sqlBulkCopyOptions">Options for the SqlBulkCopy to the incoming table. TableLock is always used, since no one else uses that table.</param>
     /// <param name="cancellationToken">Do you like to have the option to cancel the operation?</param>
     /// <returns>Number of rows in the table</returns>
-    /// <exception cref="InvalidOperationException">If the table doesn't exist</exception>
+    /// <exception cref="InvalidOperationException">If the table doesn't exist, or a mapped column doesn't exist in it</exception>
     /// <exception cref="NotSupportedException">If the table is a temp table, is referenced by a foreign key, has Change Tracking, is partitioned, temporal or memory-optimized, or OutputColumn is used</exception>
     // Preferred over the IAsyncEnumerable overload for types that implement both, like an EF Core DbSet
     [OverloadResolutionPriority(1)]
@@ -263,7 +265,7 @@ public class SqlBulkCopyHelper<TEntity>
     /// <param name="sqlBulkCopyOptions">Options for the SqlBulkCopy to the incoming table. TableLock is always used, since no one else uses that table.</param>
     /// <param name="cancellationToken">Cancels the operation. It's also passed to the source when it's enumerated.</param>
     /// <returns>Number of rows in the table</returns>
-    /// <exception cref="InvalidOperationException">If the table doesn't exist</exception>
+    /// <exception cref="InvalidOperationException">If the table doesn't exist, or a mapped column doesn't exist in it</exception>
     /// <exception cref="NotSupportedException">If the table is a temp table, is referenced by a foreign key, has Change Tracking, is partitioned, temporal or memory-optimized, or OutputColumn is used</exception>
     public ValueTask<long> BulkReplaceAsync(SqlConnection connection, IAsyncEnumerable<TEntity> entities, Action<SqlBulkReplaceOptions>? configure = null,
         int timeout = 30, SqlBulkCopyOptions sqlBulkCopyOptions = SqlBulkCopyOptions.Default, CancellationToken cancellationToken = default)
@@ -272,133 +274,24 @@ public class SqlBulkCopyHelper<TEntity>
             configure, timeout, sqlBulkCopyOptions, cancellationToken);
     }
 
-    private async ValueTask<long> BulkReplaceCoreAsync(SqlConnection connection, Func<List<DisguisedColumnDefinition<TEntity>>, DbDataReader> createReader,
+    private ValueTask<long> BulkReplaceCoreAsync(SqlConnection connection, Func<List<DisguisedColumnDefinition<TEntity>>, DbDataReader> createReader,
         Action<SqlBulkReplaceOptions>? configure, int timeout, SqlBulkCopyOptions sqlBulkCopyOptions, CancellationToken cancellationToken)
     {
-        cancellationToken.ThrowIfCancellationRequested();
-
         if (_outputColumns.Count > 0)
         {
             throw new NotSupportedException("OutputColumn can't be combined with BulkReplaceAsync.");
         }
 
-        if (_tableNameParts.Count > 2)
+        var columnMappings = _columnDefinitions.Select(x => (x.ColumnName, QuoteName(x.ColumnName))).ToList();
+
+        return BulkReplace.ReplaceAsync(connection, GetTableName(), _tableNameParts, columnMappings, _configureBulkCopy, async (bulkCopy, ct) =>
         {
-            throw new NotSupportedException($"BulkReplaceAsync only supports tables in the current database, so '{_tableName}' can't have a database part.");
-        }
-
-        if (Unquote(_tableNameParts[^1]).StartsWith('#'))
-        {
-            throw new NotSupportedException("BulkReplaceAsync doesn't support temp tables, since no one else can read them. Use TRUNCATE TABLE and BulkInsertAsync instead.");
-        }
-
-        var options = new SqlBulkReplaceOptions();
-        configure?.Invoke(options);
-
-        return await ExecuteAsync(connection, sqlTransaction: null, useOwnTransaction: false,
-            _ => ReplaceAsync(connection, createReader, options, timeout, sqlBulkCopyOptions, cancellationToken),
-            cancellationToken).ConfigureAwait(false);
-    }
-
-    private async ValueTask<long> ReplaceAsync(SqlConnection connection, Func<List<DisguisedColumnDefinition<TEntity>>, DbDataReader> createReader,
-        SqlBulkReplaceOptions options, int timeout, SqlBulkCopyOptions sqlBulkCopyOptions, CancellationToken cancellationToken)
-    {
-        var table = await TableStructure.ReadAsync(connection, GetTableName(), timeout, cancellationToken).ConfigureAwait(false);
-        var (incoming, outgoing) = CreateSwapTableNames(table);
-
-        // Only the tables created here are dropped, a table with the same name could belong to another replace
-        var dropTables = new List<string>();
-        try
-        {
-            await ExecuteNonQueryAsync(connection, null, table.CreateTableScript(incoming), timeout, cancellationToken).ConfigureAwait(false);
-            dropTables.Add(incoming);
-            await ExecuteNonQueryAsync(connection, null, table.CreateTableScript(outgoing), timeout, cancellationToken).ConfigureAwait(false);
-            dropTables.Add(outgoing);
-
-            // No one else uses the incoming table, so it's locked for a faster load
-            var rows = await WriteToServerAsync(connection, null, incoming, createReader(_columnDefinitions), extraColumnMappings: [], timeout,
-                sqlBulkCopyOptions | SqlBulkCopyOptions.TableLock, cancellationToken).ConfigureAwait(false);
-
-            var indexesAndConstraints = table.CreateIndexesAndConstraintsScript(incoming);
-            if (indexesAndConstraints.Length > 0)
+            var reader = createReader(_columnDefinitions);
+            await using (reader.ConfigureAwait(false))
             {
-                await ExecuteNonQueryAsync(connection, null, indexesAndConstraints, timeout, cancellationToken).ConfigureAwait(false);
+                await bulkCopy.WriteToServerAsync(reader, ct).ConfigureAwait(false);
             }
-
-            await SwapAsync(connection, table, incoming, outgoing, options, timeout, cancellationToken).ConfigureAwait(false);
-            return rows;
-        }
-        finally
-        {
-            // After the swap the outgoing table has the old rows, and if the swap didn't happen the incoming table has the new rows
-            if (dropTables.Count > 0)
-            {
-                try
-                {
-                    await ExecuteNonQueryAsync(connection, null, string.Concat(dropTables.Select(x => $"DROP TABLE IF EXISTS {x};{Environment.NewLine}")),
-                        timeout, CancellationToken.None).ConfigureAwait(false);
-                }
-                catch
-                {
-                    // A failed clean-up should not hide the original exception
-                }
-            }
-        }
-    }
-
-    /// <summary>
-    /// The old rows are switched out to the empty outgoing table and then the new rows are switched in, since SWITCH can only switch into an empty table.
-    /// Switching out, instead of TRUNCATE, makes it possible to wait at low priority, and the old rows are dropped after the transaction.
-    /// </summary>
-    private static async Task SwapAsync(SqlConnection connection, TableStructure table, string incoming, string outgoing, SqlBulkReplaceOptions options,
-        int timeout, CancellationToken cancellationToken)
-    {
-        var sb = new StringBuilder();
-        sb.Append("ALTER TABLE ").Append(table.QuotedName).Append(" SWITCH TO ").Append(outgoing);
-
-        var swapTimeout = timeout;
-        if (options.LowPriorityMaxDurationMinutes is { } minutes)
-        {
-            sb.Append(" WITH (WAIT_AT_LOW_PRIORITY (MAX_DURATION = ").Append(minutes.ToString(CultureInfo.InvariantCulture))
-                .Append(" MINUTES, ABORT_AFTER_WAIT = ").Append(options.AbortAfterWait.ToString().ToUpperInvariant()).Append("))");
-
-            // The wait is part of the command, so it shouldn't time out before the wait is over
-            swapTimeout = timeout == 0 ? 0 : timeout + minutes * 60;
-        }
-
-        sb.AppendLine(";");
-
-        // The table is already locked by the first SWITCH, so this doesn't wait
-        sb.Append("ALTER TABLE ").Append(incoming).Append(" SWITCH TO ").Append(table.QuotedName).AppendLine(";");
-
-        if (table.HasIdentity)
-        {
-            // SWITCH doesn't update the identity of the table, so the next insert could get a value that one of the new rows already has
-            sb.Append("DBCC CHECKIDENT (N'").Append(table.QuotedName.Replace("'", "''")).AppendLine("', RESEED) WITH NO_INFOMSGS;");
-        }
-
-        await ExecuteAsync(connection, sqlTransaction: null, useOwnTransaction: true, async transaction =>
-        {
-            await ExecuteNonQueryAsync(connection, transaction, sb.ToString(), swapTimeout, cancellationToken).ConfigureAwait(false);
-            return true;
-        }, cancellationToken).ConfigureAwait(false);
-    }
-
-    /// <summary>
-    /// The incoming and outgoing tables, in the same schema as the table since SWITCH requires it. A long table name is shortened, since a name can be at most 128 characters.
-    /// </summary>
-    private static (string Incoming, string Outgoing) CreateSwapTableNames(TableStructure table)
-    {
-        var timestamp = DateTime.UtcNow.ToString("yyyyMMddHHmmss", CultureInfo.InvariantCulture);
-
-        string CreateName(string kind)
-        {
-            var suffix = "_" + kind + "_" + timestamp;
-            var name = table.TableName.Length + suffix.Length > 128 ? table.TableName[..(128 - suffix.Length)] : table.TableName;
-            return Quote(table.SchemaName) + "." + Quote(name + suffix);
-        }
-
-        return (CreateName("Incoming"), CreateName("Outgoing"));
+        }, configure, timeout, sqlBulkCopyOptions, cancellationToken);
     }
 
     /// <summary>
@@ -426,67 +319,6 @@ public class SqlBulkCopyHelper<TEntity>
             .ToList();
 
         return new UpsertColumns(keys.Select(QuoteName).ToList(), updated.Select(QuoteName).ToList(), options.UpdateOnlyWhenChanged, options.DuplicateKeyHandling);
-    }
-
-    /// <summary>
-    /// Opens the connection if it's closed, and closes it again when done.
-    /// With useOwnTransaction a transaction is started, committed if work succeeds and rolled back if it fails.
-    /// </summary>
-    private static async ValueTask<T> ExecuteAsync<T>(SqlConnection connection, SqlTransaction? sqlTransaction, bool useOwnTransaction,
-        Func<SqlTransaction?, ValueTask<T>> work, CancellationToken cancellationToken)
-    {
-        var closeConnection = false;
-        if (connection.State != ConnectionState.Open)
-        {
-            await connection.OpenAsync(cancellationToken).ConfigureAwait(false);
-            closeConnection = true;
-        }
-
-        SqlTransaction? ownTransaction = null;
-        try
-        {
-            if (useOwnTransaction)
-            {
-                ownTransaction = (SqlTransaction)await connection.BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
-            }
-
-            try
-            {
-                var result = await work(sqlTransaction ?? ownTransaction).ConfigureAwait(false);
-
-                if (ownTransaction is not null)
-                {
-                    await ownTransaction.CommitAsync(cancellationToken).ConfigureAwait(false);
-                }
-
-                return result;
-            }
-            catch when (ownTransaction is not null)
-            {
-                try
-                {
-                    await ownTransaction.RollbackAsync(CancellationToken.None).ConfigureAwait(false);
-                }
-                catch
-                {
-                    // A failed rollback should not hide the original exception
-                }
-
-                throw;
-            }
-        }
-        finally
-        {
-            if (ownTransaction is not null)
-            {
-                await ownTransaction.DisposeAsync().ConfigureAwait(false);
-            }
-
-            if (closeConnection)
-            {
-                await connection.CloseAsync().ConfigureAwait(false);
-            }
-        }
     }
 
     private async ValueTask<long> WriteToServerAsync(SqlConnection connection, SqlTransaction? transaction, string destinationTableName, DbDataReader reader,
@@ -851,36 +683,6 @@ public class SqlBulkCopyHelper<TEntity>
             .Append(" FROM ").Append(tables.Output).Append(" ORDER BY ").Append(RowNumberColumn).AppendLine(";");
     }
 
-    private static async Task ExecuteNonQueryAsync(SqlConnection connection, SqlTransaction? transaction, string sql, int timeout, CancellationToken cancellationToken)
-    {
-        var command = connection.CreateCommand();
-        await using (command.ConfigureAwait(false))
-        {
-            command.Transaction = transaction;
-            command.CommandTimeout = timeout;
-            command.CommandText = sql;
-            await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
-        }
-    }
-
-    private static async ValueTask<T> ExecuteReaderAsync<T>(SqlConnection connection, SqlTransaction? transaction, string sql, int timeout,
-        Func<SqlDataReader, ValueTask<T>> read, CancellationToken cancellationToken)
-    {
-        var command = connection.CreateCommand();
-        await using (command.ConfigureAwait(false))
-        {
-            command.Transaction = transaction;
-            command.CommandTimeout = timeout;
-            command.CommandText = sql;
-
-            var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
-            await using (reader.ConfigureAwait(false))
-            {
-                return await read(reader).ConfigureAwait(false);
-            }
-        }
-    }
-
     /// <summary>
     /// Can be used to add or change how Types are mapped for the value in SqlBulkCopyHelperColumnInfo.SchemaDefinition.
     /// Intention is just to use these mappings for a staging table. They might be on the "bigger" side.
@@ -1164,80 +966,5 @@ public class SqlBulkCopyHelper<TEntity>
     /// Without quoting, the table name is used as it was provided.
     /// Empty parts (like in "db..Table") are kept empty.
     /// </summary>
-    private string GetTableName() =>
-        string.Join(".", _tableNameParts.Select(part => _useQuoting && part.Length > 0 ? Quote(Unquote(part)) : part));
-
-    private static string Quote(string name) => "[" + name.Replace("]", "]]") + "]";
-
-    private static string Unquote(string part)
-    {
-        if (part.Length >= 2 && part[0] == '[' && part[^1] == ']')
-        {
-            return part[1..^1].Replace("]]", "]");
-        }
-
-        if (part.Length >= 2 && part[0] == '"' && part[^1] == '"')
-        {
-            return part[1..^1].Replace("\"\"", "\"");
-        }
-
-        return part;
-    }
-
-    /// <summary>
-    /// Splits "db.[dbo].[My.Table]" into "db", "[dbo]" and "[My.Table]". A dot inside [] or "" is part of the name.
-    /// </summary>
-    private static List<string> SplitMultipartName(string name)
-    {
-        var parts = new List<string>();
-        var current = new StringBuilder();
-        char? closingQuote = null;
-
-        for (var i = 0; i < name.Length; i++)
-        {
-            var c = name[i];
-
-            if (closingQuote is not null)
-            {
-                current.Append(c);
-                if (c != closingQuote)
-                {
-                    continue;
-                }
-
-                // ]] inside [] (or "" inside "") is an escaped quote and not the end of the part
-                if (i + 1 < name.Length && name[i + 1] == closingQuote)
-                {
-                    current.Append(name[++i]);
-                }
-                else
-                {
-                    closingQuote = null;
-                }
-            }
-            else if (c == '.')
-            {
-                parts.Add(current.ToString());
-                current.Clear();
-            }
-            else
-            {
-                closingQuote = c switch
-                {
-                    '[' => ']',
-                    '"' => '"',
-                    _ => null
-                };
-                current.Append(c);
-            }
-        }
-
-        if (closingQuote is not null)
-        {
-            throw new ArgumentException($"Table name '{name}' has a quoted part that is not terminated.", nameof(name));
-        }
-
-        parts.Add(current.ToString());
-        return parts;
-    }
+    private string GetTableName() => _useQuoting ? QuoteMultipartName(_tableNameParts) : _tableName;
 }

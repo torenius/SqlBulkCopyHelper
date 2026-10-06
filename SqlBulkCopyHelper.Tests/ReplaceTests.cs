@@ -1,3 +1,4 @@
+using System.Data;
 using System.Diagnostics;
 using Dapper;
 using Microsoft.Data.SqlClient;
@@ -362,5 +363,143 @@ public partial class BulkInsertTests
             await CreateReplaceHelper("dbo.Missing").BulkReplaceAsync(connection, ReplaceRows("A"), cancellationToken: TestContext.Current.CancellationToken));
 
         exception.Message.ShouldContain("was not found");
+    }
+
+    private async Task<string> CreateReplaceTableAsync(SqlConnection connection)
+    {
+        var tableName = "dbo." + NewReplaceTableName();
+        await connection.ExecuteAsync($"CREATE TABLE {tableName} (Id int NOT NULL PRIMARY KEY, Name nvarchar(50) NULL, Quantity int NOT NULL); INSERT INTO {tableName} VALUES (1, N'Old', 1);");
+        return tableName;
+    }
+
+    private static DataTable CreateReplaceDataTable(params string[] columnNames)
+    {
+        var dataTable = new DataTable();
+        foreach (var columnName in columnNames)
+        {
+            dataTable.Columns.Add(columnName, columnName == "Name" ? typeof(string) : typeof(int));
+        }
+
+        return dataTable;
+    }
+
+    [Fact]
+    public async Task Replace_Extension_Entities()
+    {
+        await using var connection = await OpenReplaceConnectionAsync();
+        var tableName = await CreateReplaceTableAsync(connection);
+
+        var rows = await connection.BulkReplaceAsync(tableName, ReplaceRows("A", "B"), cancellationToken: TestContext.Current.CancellationToken);
+
+        rows.ShouldBe(2);
+        (await GetNamesAsync(connection, tableName)).ShouldBe(["A", "B"]);
+        await ShouldHaveNoSwapTablesAsync(connection);
+    }
+
+    [Fact]
+    public async Task Replace_Extension_AsyncEnumerable()
+    {
+        await using var connection = await OpenReplaceConnectionAsync();
+        var tableName = await CreateReplaceTableAsync(connection);
+
+        var rows = await connection.BulkReplaceAsync(tableName, ReplaceRows("A", "B").ToAsyncEnumerable(), cancellationToken: TestContext.Current.CancellationToken);
+
+        rows.ShouldBe(2);
+        (await GetNamesAsync(connection, tableName)).ShouldBe(["A", "B"]);
+    }
+
+    [Fact]
+    public async Task Replace_DataTable_MapsByName_AndSkipsDeletedRows()
+    {
+        await using var connection = await OpenReplaceConnectionAsync();
+        var tableName = await CreateReplaceTableAsync(connection);
+
+        // Not in the same order as the table
+        var dataTable = CreateReplaceDataTable("Quantity", "Name", "Id");
+        dataTable.Rows.Add(10, "A", 1);
+        dataTable.Rows.Add(20, "B", 2);
+        dataTable.Rows.Add(30, "C", 3);
+        dataTable.AcceptChanges();
+        dataTable.Rows[1].Delete();
+
+        var rows = await connection.BulkReplaceAsync(tableName, dataTable, cancellationToken: TestContext.Current.CancellationToken);
+
+        rows.ShouldBe(2);
+        (await connection.QueryAsync<(int, string, int)>($"SELECT Id, Name, Quantity FROM {tableName} ORDER BY Id")).ShouldBe([(1, "A", 10), (3, "C", 30)]);
+        await ShouldHaveNoSwapTablesAsync(connection);
+    }
+
+    [Fact]
+    public async Task Replace_DataTable_ConfigureBulkCopy_CanChangeTheMappings()
+    {
+        await using var connection = await OpenReplaceConnectionAsync();
+        var tableName = await CreateReplaceTableAsync(connection);
+
+        // Existing code that relies on the order of the columns, instead of their names
+        var dataTable = new DataTable();
+        dataTable.Columns.Add("Column1", typeof(int));
+        dataTable.Columns.Add("Column2", typeof(string));
+        dataTable.Columns.Add("Column3", typeof(int));
+        dataTable.Rows.Add(1, "A", 10);
+
+        await connection.BulkReplaceAsync(tableName, dataTable, configureBulkCopy: bulkCopy =>
+        {
+            bulkCopy.ColumnMappings.Clear();
+            bulkCopy.ColumnMappings.Add(0, 0);
+            bulkCopy.ColumnMappings.Add(1, 1);
+            bulkCopy.ColumnMappings.Add(2, 2);
+        }, cancellationToken: TestContext.Current.CancellationToken);
+
+        (await connection.QueryAsync<(int, string, int)>($"SELECT Id, Name, Quantity FROM {tableName}")).ShouldBe([(1, "A", 10)]);
+    }
+
+    [Fact]
+    public async Task Replace_DataTable_ColumnMissingInTable_TableIsUnchanged()
+    {
+        await using var connection = await OpenReplaceConnectionAsync();
+        var tableName = await CreateReplaceTableAsync(connection);
+
+        var dataTable = CreateReplaceDataTable("Id", "Name", "Quantity", "Missing");
+        dataTable.Rows.Add(1, "A", 10, 0);
+
+        var exception = await Should.ThrowAsync<InvalidOperationException>(async () =>
+            await connection.BulkReplaceAsync(tableName, dataTable, cancellationToken: TestContext.Current.CancellationToken));
+
+        exception.Message.ShouldContain("[Missing]");
+        (await GetNamesAsync(connection, tableName)).ShouldBe(["Old"]);
+        await ShouldHaveNoSwapTablesAsync(connection);
+    }
+
+    [Fact]
+    public async Task Replace_DataReader_FromAnotherConnection_IsNotDisposed()
+    {
+        await using var connection = await OpenReplaceConnectionAsync();
+        var tableName = await CreateReplaceTableAsync(connection);
+        var sourceTableName = await CreateReplaceTableAsync(connection);
+        await connection.ExecuteAsync($"INSERT INTO {sourceTableName} VALUES (2, N'A', 2), (3, N'B', 3);");
+
+        await using var sourceConnection = await OpenReplaceConnectionAsync();
+        await using var command = new SqlCommand($"SELECT Quantity, Name, Id FROM {sourceTableName} WHERE Id > 1", sourceConnection);
+        await using var reader = await command.ExecuteReaderAsync(TestContext.Current.CancellationToken);
+
+        var rows = await connection.BulkReplaceAsync(tableName, reader, cancellationToken: TestContext.Current.CancellationToken);
+
+        rows.ShouldBe(2);
+        reader.IsClosed.ShouldBeFalse();
+        (await connection.QueryAsync<(int, string, int)>($"SELECT Id, Name, Quantity FROM {tableName} ORDER BY Id")).ShouldBe([(2, "A", 2), (3, "B", 3)]);
+        await ShouldHaveNoSwapTablesAsync(connection);
+    }
+
+    [Theory]
+    [InlineData("#Temp", "temp tables")]
+    [InlineData("master.dbo.Table", "current database")]
+    public async Task Replace_DataTable_TableName_NotSupported(string tableName, string message)
+    {
+        await using var connection = await OpenReplaceConnectionAsync();
+
+        var exception = await Should.ThrowAsync<NotSupportedException>(async () =>
+            await connection.BulkReplaceAsync(tableName, CreateReplaceDataTable("Id"), cancellationToken: TestContext.Current.CancellationToken));
+
+        exception.Message.ShouldContain(message);
     }
 }
